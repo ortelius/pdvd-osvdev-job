@@ -507,8 +507,8 @@ func newVuln(vulnJSON string) error {
 	return nil
 }
 
-// @title Ortelius v11 Vulnerability Microservice
-// @version 11.0.0
+// @title Ortelius v12 OSV Loader
+// @version 12.0.0
 // @description Vulnerabilities from osv.dev
 // @description ![Release](https://img.shields.io/github/v/release/ortelius/cve2release-tracker?sort=semver)
 // @description ![license](https://img.shields.io/github/license/ortelius/.github)
