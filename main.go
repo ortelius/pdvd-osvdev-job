@@ -245,7 +245,7 @@ func LoadFromOSVDev() {
 	// Convert the body to type string
 	ecosystems := strings.Split(string(body), "\n")
 
-	for _, platform := pdvd-osvdev-job{
+	for _, platform := range ecosystems {
 		if len(strings.TrimSpace(platform)) == 0 {
 			continue
 		}
