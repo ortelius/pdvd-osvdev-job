@@ -11,7 +11,6 @@ FROM cgr.dev/chainguard/glibc-dynamic@sha256:1596d00da637ed14b64d1652cf553df9b10
 WORKDIR /app
 
 COPY --from=builder /app/main .
-COPY --from=builder /app/docs docs
 
 ENV ARANGO_HOST localhost
 ENV ARANGO_USER root

@@ -18,6 +18,10 @@ import (
 	"github.com/arangodb/go-driver/v2/arangodb"
 	"github.com/ortelius/cve2release-tracker/database"
 	"github.com/ortelius/cve2release-tracker/util"
+
+	// CVSS libraries
+	gocvss31 "github.com/pandatix/go-cvss/31"
+	gocvss40 "github.com/pandatix/go-cvss/40"
 )
 
 type vulnID struct {
@@ -38,9 +42,120 @@ func getMitreURL() string {
 	return mitreURL
 }
 
+// calculateCVSSScore calculates numeric base score from CVSS vector string
+// Returns 0 if unable to parse
+func calculateCVSSScore(vectorStr string) float64 {
+	if vectorStr == "" || !strings.HasPrefix(vectorStr, "CVSS:") {
+		return 0
+	}
+
+	// Try CVSS v3.1 first (most common in OSV data)
+	if strings.HasPrefix(vectorStr, "CVSS:3.1") || strings.HasPrefix(vectorStr, "CVSS:3.0") {
+		cvss31, err := gocvss31.ParseVector(vectorStr)
+		if err == nil {
+			return cvss31.BaseScore()
+		}
+		logger.Sugar().Debugf("Failed to parse CVSS v3 vector %s: %v", vectorStr, err)
+	}
+
+	// Try CVSS v4.0
+	if strings.HasPrefix(vectorStr, "CVSS:4.0") {
+		cvss40, err := gocvss40.ParseVector(vectorStr)
+		if err == nil {
+			return cvss40.Score()
+		}
+		logger.Sugar().Debugf("Failed to parse CVSS v4 vector %s: %v", vectorStr, err)
+	}
+
+	return 0
+}
+
+// addCVSSScoresToContent adds calculated base scores to CVE content
+// Modifies the content map in place
+// If severity is null or no valid scores found, defaults to LOW (score: 0.1)
+func addCVSSScoresToContent(content map[string]interface{}) {
+	// Get severity array
+	severity, ok := content["severity"].([]interface{})
+
+	var baseScores []float64
+	var highestScore float64
+	hasValidScore := false
+
+	// Process severity entries if they exist
+	if ok && len(severity) > 0 {
+		for _, sev := range severity {
+			sevMap, ok := sev.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			scoreStr, ok := sevMap["score"].(string)
+			if !ok || scoreStr == "" {
+				continue
+			}
+
+			sevType, _ := sevMap["type"].(string)
+
+			// Only calculate for CVSS vectors
+			if sevType == "CVSS_V3" || sevType == "CVSS_V4" {
+				baseScore := calculateCVSSScore(scoreStr)
+				if baseScore > 0 {
+					baseScores = append(baseScores, baseScore)
+					hasValidScore = true
+
+					if baseScore > highestScore {
+						highestScore = baseScore
+					}
+				}
+			}
+		}
+	}
+
+	// If no valid scores found (null severity, missing scores, or parse failures),
+	// default to LOW severity with score 0.1
+	if !hasValidScore {
+		highestScore = 0.1
+		baseScores = []float64{0.1}
+		logger.Sugar().Debugf("CVE %s has no valid CVSS scores, defaulting to LOW (0.1)", content["_key"])
+	}
+
+	// Store calculated scores in database_specific field
+	if content["database_specific"] == nil {
+		content["database_specific"] = make(map[string]interface{})
+	}
+
+	dbSpecific := content["database_specific"].(map[string]interface{})
+	dbSpecific["cvss_base_scores"] = baseScores
+	dbSpecific["cvss_base_score"] = highestScore // Highest score for easy querying
+
+	// Also add severity rating based on score
+	dbSpecific["severity_rating"] = getSeverityRating(highestScore)
+
+	content["database_specific"] = dbSpecific
+
+	if hasValidScore {
+		logger.Sugar().Debugf("Added CVSS scores to CVE %s: highest=%.1f", content["_key"], highestScore)
+	}
+}
+
+// getSeverityRating returns CVSS severity rating based on base score
+func getSeverityRating(score float64) string {
+	if score == 0 {
+		return "NONE"
+	} else if score < 4.0 {
+		return "LOW"
+	} else if score < 7.0 {
+		return "MEDIUM"
+	} else if score < 9.0 {
+		return "HIGH"
+	}
+	return "CRITICAL"
+}
+
 // unpackAndLoad
 func unpackAndLoad(src string) error {
 
+	fmt.Println(src)
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -130,7 +245,7 @@ func LoadFromOSVDev() {
 	// Convert the body to type string
 	ecosystems := strings.Split(string(body), "\n")
 
-	for _, platform := range ecosystems {
+	for _, platform := pdvd-osvdev-job{
 		if len(strings.TrimSpace(platform)) == 0 {
 			continue
 		}
@@ -277,6 +392,9 @@ func newVuln(vulnJSON string) error {
 
 	// Add objtype field
 	content["objtype"] = "CVE"
+
+	// CRITICAL: Add calculated CVSS scores before storing
+	addCVSSScoresToContent(content)
 
 	// UPSERT the CVE document
 	query := `
