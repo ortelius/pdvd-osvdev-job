@@ -1,6 +1,6 @@
-# Ortelius v11 Vulnerability Microservice
+# Ortelius v12 OSV Loader
 
-> Version 11.0.0
+> Version 12.0.0
 
 Vulnerabilities from osv.dev
 ![Release](https://img.shields.io/github/v/release/ortelius/pdvd-osvdev-job?sort=semver)
@@ -13,16 +13,3 @@ Vulnerabilities from osv.dev
 
 ![Discord](https://img.shields.io/discord/722468819091849316)
 
-## Path Table
-
-| Method | Path | Description |
-| --- | --- | --- |
-
-## Reference Table
-
-| Name | Path | Description |
-| --- | --- | --- |
-
-## Path Details
-
-## References
