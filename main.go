@@ -16,19 +16,22 @@ import (
 	"strings"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
-	"github.com/ortelius/cve2release-tracker/database"
-	"github.com/ortelius/cve2release-tracker/util"
+	"github.com/google/osv-scanner/pkg/models"
+	"github.com/ortelius/pdvd-backend/v12/database"
+	"github.com/ortelius/pdvd-backend/v12/util"
 
 	// CVSS libraries
 	gocvss31 "github.com/pandatix/go-cvss/31"
 	gocvss40 "github.com/pandatix/go-cvss/40"
 )
 
+// vulnID holds basic vulnerability identification information
 type vulnID struct {
 	ID       string `json:"id"`
 	Modified string `json:"modified"`
 }
 
+// cveText holds vulnerability description for MITRE mapping
 type cveText struct {
 	Description string `json:"cvetext"`
 }
@@ -36,6 +39,7 @@ type cveText struct {
 var logger = database.InitLogger()
 var dbconn = database.InitializeDatabase()
 
+// getMitreURL retrieves the MITRE mapping URL from environment
 func getMitreURL() string {
 	// Get the environment variable value for MITER_MAPPING_URL
 	mitreURL := os.Getenv("MITRE_MAPPING_URL")
@@ -49,7 +53,6 @@ func calculateCVSSScore(vectorStr string) float64 {
 		return 0
 	}
 
-	// Try CVSS v3.1 first (most common in OSV data)
 	if strings.HasPrefix(vectorStr, "CVSS:3.1") || strings.HasPrefix(vectorStr, "CVSS:3.0") {
 		cvss31, err := gocvss31.ParseVector(vectorStr)
 		if err == nil {
@@ -58,7 +61,6 @@ func calculateCVSSScore(vectorStr string) float64 {
 		logger.Sugar().Debugf("Failed to parse CVSS v3 vector %s: %v", vectorStr, err)
 	}
 
-	// Try CVSS v4.0
 	if strings.HasPrefix(vectorStr, "CVSS:4.0") {
 		cvss40, err := gocvss40.ParseVector(vectorStr)
 		if err == nil {
@@ -74,14 +76,12 @@ func calculateCVSSScore(vectorStr string) float64 {
 // Modifies the content map in place
 // If severity is null or no valid scores found, defaults to LOW (score: 0.1)
 func addCVSSScoresToContent(content map[string]interface{}) {
-	// Get severity array
 	severity, ok := content["severity"].([]interface{})
 
 	var baseScores []float64
 	var highestScore float64
 	hasValidScore := false
 
-	// Process severity entries if they exist
 	if ok && len(severity) > 0 {
 		for _, sev := range severity {
 			sevMap, ok := sev.(map[string]interface{})
@@ -96,7 +96,6 @@ func addCVSSScoresToContent(content map[string]interface{}) {
 
 			sevType, _ := sevMap["type"].(string)
 
-			// Only calculate for CVSS vectors
 			if sevType == "CVSS_V3" || sevType == "CVSS_V4" {
 				baseScore := calculateCVSSScore(scoreStr)
 				if baseScore > 0 {
@@ -111,24 +110,20 @@ func addCVSSScoresToContent(content map[string]interface{}) {
 		}
 	}
 
-	// If no valid scores found (null severity, missing scores, or parse failures),
-	// default to LOW severity with score 0.1
 	if !hasValidScore {
 		highestScore = 0.1
 		baseScores = []float64{0.1}
 		logger.Sugar().Debugf("CVE %s has no valid CVSS scores, defaulting to LOW (0.1)", content["_key"])
 	}
 
-	// Store calculated scores in database_specific field
 	if content["database_specific"] == nil {
 		content["database_specific"] = make(map[string]interface{})
 	}
 
 	dbSpecific := content["database_specific"].(map[string]interface{})
 	dbSpecific["cvss_base_scores"] = baseScores
-	dbSpecific["cvss_base_score"] = highestScore // Highest score for easy querying
+	dbSpecific["cvss_base_score"] = highestScore
 
-	// Also add severity rating based on score
 	dbSpecific["severity_rating"] = getSeverityRating(highestScore)
 
 	content["database_specific"] = dbSpecific
@@ -152,7 +147,7 @@ func getSeverityRating(score float64) string {
 	return "CRITICAL"
 }
 
-// unpackAndLoad
+// unpackAndLoad extracts and processes vulnerabilities from a zip archive
 func unpackAndLoad(src string) error {
 
 	fmt.Println(src)
@@ -166,10 +161,8 @@ func unpackAndLoad(src string) error {
 		}
 	}()
 
-	// Closure to address file descriptors issue with all the deferred .Close() methods
 	extractAndWriteFile := func(f *zip.File) error {
 
-		// Check for ZipSlip: https://snyk.io/research/zip-slip-vulnerability
 		if strings.Contains(f.Name, "/") {
 			return fmt.Errorf("%s: illegal file path", f.Name)
 		}
@@ -187,7 +180,7 @@ func unpackAndLoad(src string) error {
 		if !f.FileInfo().IsDir() {
 			var vulnJSON strings.Builder
 
-			_, err = io.Copy(&vulnJSON, rc) // #nosec G110
+			_, err = io.Copy(&vulnJSON, rc)
 			if err != nil {
 				return err
 			}
@@ -198,7 +191,6 @@ func unpackAndLoad(src string) error {
 				logger.Sugar().Infoln(err)
 			}
 
-			// Add json to db
 			if err := newVuln(vulnStr); err != nil {
 				logger.Sugar().Infoln(err)
 				logger.Sugar().Infoln(vulnStr)
@@ -235,14 +227,12 @@ func LoadFromOSVDev() {
 		logger.Sugar().Fatal(err)
 	}
 
-	// We Read the response body on the line below.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logger.Sugar().Fatalln(err)
 	}
 	resp.Body.Close()
 
-	// Convert the body to type string
 	ecosystems := strings.Split(string(body), "\n")
 
 	for _, platform := range ecosystems {
@@ -277,8 +267,16 @@ func LoadFromOSVDev() {
 
 // newVuln godoc
 // @Summary Create a Vulnerability
-// @Description Create a new Vulnerability and persist it
+// @Description Create a new Vulnerability and persist it with version-aware edges
 // @Tags vulnerability
+// This function processes CVE/OSV data and creates hub-and-spoke relationships using:
+// - One CVE document in the 'cve' collection
+// - Multiple PURL hub documents in the 'purl' collection (one per unique package)
+// - Multiple cve2purl edges with parsed version boundaries for indexed filtering
+//
+// CRITICAL: Handles CVEs with multiple affected entries and multiple ranges per entry
+// Example: A CVE affecting package versions 0-19.2.16, 20.0.0-20.3.14, and 21.0.0-21.0.1
+// will create THREE separate edges, one for each range, enabling accurate version filtering
 func newVuln(vulnJSON string) error {
 	var existsCursor arangodb.Cursor
 	var err error
@@ -358,7 +356,6 @@ func newVuln(vulnJSON string) error {
 	mitreURL := getMitreURL()
 
 	if len(mitreURL) > 0 {
-		// #nosec G107
 		resp, err := http.Post(mitreURL, "application/json", bytes.NewBuffer(jsonData))
 		if err == nil {
 			defer resp.Body.Close()
@@ -390,13 +387,10 @@ func newVuln(vulnJSON string) error {
 		return nil
 	}
 
-	// Add objtype field
 	content["objtype"] = "CVE"
 
-	// CRITICAL: Add calculated CVSS scores before storing
 	addCVSSScoresToContent(content)
 
-	// UPSERT the CVE document
 	query := `
 		UPSERT { _key: @key }
 		INSERT @doc
@@ -416,116 +410,293 @@ func newVuln(vulnJSON string) error {
 	}
 	cursor.Close()
 
-	// Extract and process PURLs - use base PURLs (without version) for hub-and-spoke
-	var basePurls []string
-	if affected, ok := content["affected"].([]interface{}); ok {
-		purlSet := make(map[string]bool) // Use map to ensure uniqueness
+	// ============================================================================
+	// CRITICAL SECTION: Multi-Range Edge Creation
+	// ============================================================================
+	// This section processes CVE vulnerability ranges and creates version-aware edges.
+	//
+	// IMPORTANT: CVEs can have multiple affected entries (e.g., one CVE affecting
+	// multiple version ranges like 0-19.x, 20.x-20.3.x, 21.0.x-21.0.y).
+	// Each affected entry and each range within an entry creates a SEPARATE edge.
+	//
+	// Example CVE structure:
+	// {
+	//   "affected": [
+	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "0", "fixed": "19.2.16"}] },
+	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "20.0.0", "fixed": "20.3.14"}] },
+	//     { "package": "pkg:npm/@angular/common", "ranges": [{"introduced": "21.0.0", "fixed": "21.0.1"}] }
+	//   ]
+	// }
+	//
+	// This creates THREE edges, enabling the AQL query to match versions in ANY of these ranges
+	// using indexed numeric comparison instead of expensive Go validation.
+	// ============================================================================
 
+	// EdgeCandidate represents one complete version range for edge creation
+	// Each candidate will become a separate cve2purl edge in the database
+	type EdgeCandidate struct {
+		BasePurl          string // Base PURL without version (e.g., pkg:npm/@angular/common)
+		Ecosystem         string // Package ecosystem (npm, pypi, maven, etc.)
+		IntroducedMajor   *int   // Introduced version major component
+		IntroducedMinor   *int   // Introduced version minor component
+		IntroducedPatch   *int   // Introduced version patch component
+		FixedMajor        *int   // Fixed version major component
+		FixedMinor        *int   // Fixed version minor component
+		FixedPatch        *int   // Fixed version patch component
+		LastAffectedMajor *int   // Last affected version major component (alternative to fixed)
+		LastAffectedMinor *int   // Last affected version minor component
+		LastAffectedPatch *int   // Last affected version patch component
+	}
+
+	var edgeCandidates []EdgeCandidate
+	uniqueBasePurls := make(map[string]bool)
+
+	// CRITICAL FIX: Process each affected entry and each range separately
+	// This handles CVEs with multiple affected entries (like GHSA-58c5-g7wp-6w37)
+	// and CVEs with multiple ranges per affected entry
+	if affected, ok := content["affected"].([]interface{}); ok {
 		for _, aff := range affected {
+			var affectedData models.Affected
+			affBytes, _ := json.Marshal(aff)
+			json.Unmarshal(affBytes, &affectedData)
+
+			var basePurl string
+			var ecosystem string
+
 			if affMap, ok := aff.(map[string]interface{}); ok {
 				if pkg, ok := affMap["package"].(map[string]interface{}); ok {
-					// First try to get PURL directly from package
 					if purlStr, ok := pkg["purl"].(string); ok && purlStr != "" {
-						// Clean the PURL
 						cleanedPurl, err := util.CleanPURL(purlStr)
 						if err != nil {
 							logger.Sugar().Warnf("Failed to parse PURL %s: %v", purlStr, err)
 							continue
 						}
-						// Get base PURL (without version)
-						basePurl, err := util.GetBasePURL(cleanedPurl)
+						basePurl, err = util.GetBasePURL(cleanedPurl)
 						if err != nil {
 							logger.Sugar().Warnf("Failed to get base PURL from %s: %v", cleanedPurl, err)
 							continue
 						}
-						purlSet[basePurl] = true
+						parsed, _ := util.ParsePURL(cleanedPurl)
+						ecosystem = parsed.Type
 					} else {
-						// Construct PURL from ecosystem and name if purl field is missing
-						if ecosystem, ok := pkg["ecosystem"].(string); ok {
+						if ecosystemStr, ok := pkg["ecosystem"].(string); ok {
 							if name, ok := pkg["name"].(string); ok {
-								purlType := util.EcosystemToPurlType(ecosystem)
+								purlType := util.EcosystemToPurlType(ecosystemStr)
 								if purlType != "" {
-									basePurl := fmt.Sprintf("pkg:%s/%s", purlType, name)
-									purlSet[basePurl] = true
+									basePurl = fmt.Sprintf("pkg:%s/%s", purlType, name)
+									ecosystem = purlType
 								}
 							}
 						}
 					}
 				}
 			}
-		}
 
-		// Convert map to slice
-		for purl := range purlSet {
-			basePurls = append(basePurls, purl)
+			if basePurl == "" {
+				continue
+			}
+
+			uniqueBasePurls[basePurl] = true
+
+			// Process EACH range in this affected entry
+			// This is critical for CVEs with multiple version ranges
+			for _, vrange := range affectedData.Ranges {
+				if vrange.Type != models.RangeEcosystem && vrange.Type != models.RangeSemVer {
+					continue
+				}
+
+				// Extract version boundaries for THIS specific range
+				// Note: We do NOT use "introduced == nil" checks here, allowing
+				// multiple ranges to be processed independently
+				var introduced, fixed, lastAffected *util.ParsedVersion
+
+				for _, event := range vrange.Events {
+					if event.Introduced != "" {
+						introduced = util.ParseSemanticVersion(event.Introduced)
+					}
+					if event.Fixed != "" {
+						fixed = util.ParseSemanticVersion(event.Fixed)
+					}
+					if event.LastAffected != "" {
+						lastAffected = util.ParseSemanticVersion(event.LastAffected)
+					}
+				}
+
+				// Create a separate edge candidate for this range
+				// This ensures each version range gets its own indexed edge for AQL filtering
+				candidate := EdgeCandidate{
+					BasePurl:  basePurl,
+					Ecosystem: ecosystem,
+				}
+
+				if introduced != nil {
+					candidate.IntroducedMajor = introduced.Major
+					candidate.IntroducedMinor = introduced.Minor
+					candidate.IntroducedPatch = introduced.Patch
+				}
+
+				if fixed != nil {
+					candidate.FixedMajor = fixed.Major
+					candidate.FixedMinor = fixed.Minor
+					candidate.FixedPatch = fixed.Patch
+				}
+
+				if lastAffected != nil {
+					candidate.LastAffectedMajor = lastAffected.Major
+					candidate.LastAffectedMinor = lastAffected.Minor
+					candidate.LastAffectedPatch = lastAffected.Patch
+				}
+
+				edgeCandidates = append(edgeCandidates, candidate)
+			}
 		}
 	}
 
-	// Only execute AQL if we have base PURLs
-	if len(basePurls) > 0 {
+	if len(edgeCandidates) > 0 {
+		// Convert unique PURLs map to slice
+		var basePurls []string
+		for basePurl := range uniqueBasePurls {
+			basePurls = append(basePurls, basePurl)
+		}
+
+		// Upsert all unique PURLs and get their keys
+		// This creates or retrieves PURL hub documents for the hub-and-spoke pattern
 		aql = `
 			FOR purl IN @purls
-				// Upsert the purl with objtype (using base PURL without version)
 				LET upsertedPurl = FIRST(
 					UPSERT { purl: purl }
 					INSERT { purl: purl, objtype: "PURL" }
 					UPDATE {} IN purl
 					RETURN NEW
 				)
-				
-				LET purlKey = upsertedPurl._key
-				
-				// Check for existing edge
-				LET existingEdge = FIRST(
-					FOR edge IN cve2purl
-						FILTER edge._from == @cveId
-						   AND edge._to == CONCAT("purl/", purlKey)
-						RETURN edge
-				)
-				
-				// Insert edge if it doesn't exist (CVE -> PURL)
-				FILTER existingEdge == NULL
-				INSERT { 
-					_from: @cveId, 
-					_to: CONCAT("purl/", purlKey) 
-				} INTO cve2purl
+				RETURN {
+					purl: purl,
+					key: upsertedPurl._key
+				}
 		`
 
 		parameters = map[string]interface{}{
 			"purls": basePurls,
-			"cveId": fmt.Sprintf("cve/%s", content["_key"]),
 		}
 
 		cursor, err = dbconn.Database.Query(ctx, aql, &arangodb.QueryOptions{BindVars: parameters})
 		if err != nil {
-			logger.Sugar().Errorf("Failed to execute PURL edge query: %v", err)
+			logger.Sugar().Errorf("Failed to execute PURL upsert query: %v", err)
 			return err
 		}
+
+		purlKeyMap := make(map[string]string)
+		for cursor.HasMore() {
+			var result struct {
+				Purl string `json:"purl"`
+				Key  string `json:"key"`
+			}
+			_, err := cursor.ReadDocument(ctx, &result)
+			if err != nil {
+				continue
+			}
+			purlKeyMap[result.Purl] = result.Key
+		}
 		cursor.Close()
+
+		// Create edges for all candidates
+		// Each candidate becomes a separate cve2purl edge with version boundaries
+		// This allows AQL queries to use indexed numeric comparison for version filtering
+		var edges []map[string]interface{}
+		for _, candidate := range edgeCandidates {
+			purlKey, exists := purlKeyMap[candidate.BasePurl]
+			if !exists {
+				logger.Sugar().Warnf("PURL key not found for %s", candidate.BasePurl)
+				continue
+			}
+
+			edge := map[string]interface{}{
+				"_from": fmt.Sprintf("cve/%s", content["_key"]),
+				"_to":   fmt.Sprintf("purl/%s", purlKey),
+			}
+
+			if candidate.Ecosystem != "" {
+				edge["ecosystem"] = candidate.Ecosystem
+			}
+
+			// Store parsed version components for indexed filtering in AQL
+			if candidate.IntroducedMajor != nil {
+				edge["introduced_major"] = *candidate.IntroducedMajor
+			}
+			if candidate.IntroducedMinor != nil {
+				edge["introduced_minor"] = *candidate.IntroducedMinor
+			}
+			if candidate.IntroducedPatch != nil {
+				edge["introduced_patch"] = *candidate.IntroducedPatch
+			}
+
+			if candidate.FixedMajor != nil {
+				edge["fixed_major"] = *candidate.FixedMajor
+			}
+			if candidate.FixedMinor != nil {
+				edge["fixed_minor"] = *candidate.FixedMinor
+			}
+			if candidate.FixedPatch != nil {
+				edge["fixed_patch"] = *candidate.FixedPatch
+			}
+
+			if candidate.LastAffectedMajor != nil {
+				edge["last_affected_major"] = *candidate.LastAffectedMajor
+			}
+			if candidate.LastAffectedMinor != nil {
+				edge["last_affected_minor"] = *candidate.LastAffectedMinor
+			}
+			if candidate.LastAffectedPatch != nil {
+				edge["last_affected_patch"] = *candidate.LastAffectedPatch
+			}
+
+			edges = append(edges, edge)
+		}
+
+		if len(edges) > 0 {
+			// Delete existing edges for this CVE to ensure clean state
+			// This handles CVE updates where the affected versions change
+			// Uses delete-then-insert pattern to avoid duplicate edge conflicts
+			deleteQuery := `
+				FOR edge IN cve2purl
+					FILTER edge._from == @cveId
+					REMOVE edge IN cve2purl
+			`
+			deleteCursor, err := dbconn.Database.Query(ctx, deleteQuery, &arangodb.QueryOptions{
+				BindVars: map[string]interface{}{
+					"cveId": fmt.Sprintf("cve/%s", content["_key"]),
+				},
+			})
+			if err != nil {
+				logger.Sugar().Warnf("Failed to delete old edges for CVE %s: %v", content["_key"], err)
+			} else {
+				deleteCursor.Close()
+			}
+
+			// Insert all new edges in a single batch operation
+			// This creates one edge per version range, enabling indexed AQL filtering
+			insertQuery := `
+				FOR edge IN @edges
+					INSERT edge INTO cve2purl
+			`
+			insertCursor, err := dbconn.Database.Query(ctx, insertQuery, &arangodb.QueryOptions{
+				BindVars: map[string]interface{}{
+					"edges": edges,
+				},
+			})
+			if err != nil {
+				logger.Sugar().Errorf("Failed to insert edges: %v", err)
+				return err
+			}
+			insertCursor.Close()
+
+			logger.Sugar().Debugf("Created %d cve2purl edges for CVE %s", len(edges), content["_key"])
+		}
 	}
 
 	return nil
 }
 
-// @title Ortelius v12 OSV Loader
-// @version 12.0.0
-// @description Vulnerabilities from osv.dev
-// @description ![Release](https://img.shields.io/github/v/release/ortelius/cve2release-tracker?sort=semver)
-// @description ![license](https://img.shields.io/github/license/ortelius/.github)
-// @description
-// @description ![Build](https://img.shields.io/github/actions/workflow/status/ortelius/cve2release-tracker/build-push-chart.yml)
-// @description [![MegaLinter](https://github.com/ortelius/cve2release-tracker/workflows/MegaLinter/badge.svg?branch=main)](https://github.com/ortelius/cve2release-tracker/actions?query=workflow%3AMegaLinter+branch%3Amain)
-// @description ![CodeQL](https://github.com/ortelius/cve2release-tracker/workflows/CodeQL/badge.svg)
-// @description [![OpenSSF-Scorecard](https://api.securityscorecards.dev/projects/github.com/ortelius/cve2release-tracker/badge)](https://api.securityscorecards.dev/projects/github.com/ortelius/cve2release-tracker)
-// @description
-// @description ![Discord](https://img.shields.io/discord/722468819091849316)
-
-// @termsOfService http://swagger.io/terms/
-// @contact.name Ortelius Google Group
-// @contact.email ortelius-dev@googlegroups.com
-// @license.name Apache 2.0
-// @license.url http://www.apache.org/licenses/LICENSE-2.0.html
-// @host localhost:8080
 func main() {
 	LoadFromOSVDev()
 }

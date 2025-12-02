@@ -1,10 +1,11 @@
 module github.com/ortelius/osv
 
-go 1.25.3
+go 1.25.4
 
 require (
 	github.com/arangodb/go-driver/v2 v2.1.6
-	github.com/ortelius/cve2release-tracker v1.0.4
+	github.com/google/osv-scanner v1.9.2
+	github.com/ortelius/pdvd-backend/v12 v12.0.66
 	github.com/pandatix/go-cvss v0.6.2
 )
 
@@ -21,13 +22,17 @@ require (
 
 require (
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
+	github.com/aquasecurity/go-npm-version v0.0.2 // indirect
+	github.com/aquasecurity/go-pep440-version v0.0.1 // indirect
+	github.com/aquasecurity/go-version v0.0.1 // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
-	github.com/google/osv-scanner v1.9.2 // indirect
+	github.com/goccy/go-yaml v1.19.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/package-url/packageurl-go v0.1.3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	golang.org/x/sys v0.38.0 // indirect
+	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
