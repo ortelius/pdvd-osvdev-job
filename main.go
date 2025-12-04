@@ -257,6 +257,7 @@ func processEcosystem(client *http.Client, platform string) {
 	}
 
 	var maxSeenTime time.Time = lastRunTime
+	var cveCount int
 
 	// SERIAL EXECUTION: Loop through zip files one by one
 	for _, f := range zipReader.File {
@@ -296,8 +297,12 @@ func processEcosystem(client *http.Client, platform string) {
 			}
 
 			// 3. Process if new
-			if err := newVuln(content); err != nil {
+			wasUpdated, err := newVuln(content)
+			if err != nil {
 				logger.Sugar().Debugf("Error processing %s: %v", f.Name, err)
+			}
+			if wasUpdated {
+				cveCount++
 			}
 		}()
 	}
@@ -312,7 +317,7 @@ func processEcosystem(client *http.Client, platform string) {
 		if err := SaveLastRun(platform, maxSeenTime); err != nil {
 			logger.Sugar().Errorf("Failed to save high water mark for %s: %v", platform, err)
 		} else {
-			logger.Sugar().Infof("Completed %s. New High Water Mark: %v", platform, maxSeenTime)
+			logger.Sugar().Infof("Completed %s. Added/Updated %d vulnerabilities. New High Water Mark: %v", platform, cveCount, maxSeenTime)
 		}
 	} else {
 		logger.Sugar().Infof("Completed %s. No new data.", platform)
@@ -320,12 +325,13 @@ func processEcosystem(client *http.Client, platform string) {
 }
 
 // newVuln persists the vulnerability
-func newVuln(content map[string]interface{}) error {
+// Returns true if the vulnerability was upserted (added or updated), false if skipped
+func newVuln(content map[string]interface{}) (bool, error) {
 	var ctx = context.Background()
 
 	id, ok := content["id"].(string)
 	if !ok || id == "" {
-		return nil
+		return false, nil
 	}
 
 	content["_key"] = strings.ReplaceAll(id, " ", "-")
@@ -343,14 +349,14 @@ func newVuln(content map[string]interface{}) error {
 			var existingMod string
 			if _, err := cursor.ReadDocument(ctx, &existingMod); err == nil {
 				if existingMod == modDate {
-					return nil // Exact match exists
+					return false, nil // Exact match exists
 				}
 			}
 		}
 	}
 
 	if _, exists := content["affected"]; !exists {
-		return nil
+		return false, nil
 	}
 
 	content["objtype"] = "CVE"
@@ -360,10 +366,10 @@ func newVuln(content map[string]interface{}) error {
 	bindVars := map[string]interface{}{"key": key, "doc": content}
 
 	if _, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{BindVars: bindVars}); err != nil {
-		return err
+		return false, err
 	}
 
-	return processEdges(ctx, content)
+	return true, processEdges(ctx, content)
 }
 
 func processEdges(ctx context.Context, content map[string]interface{}) error {
