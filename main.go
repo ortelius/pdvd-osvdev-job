@@ -102,16 +102,18 @@ func addCVSSScoresToContent(content map[string]interface{}) {
 }
 
 func getSeverityRating(score float64) string {
-	if score == 0 {
+	switch {
+	case score == 0:
 		return "NONE"
-	} else if score < 4.0 {
+	case score < 4.0:
 		return "LOW"
-	} else if score < 7.0 {
+	case score < 7.0:
 		return "MEDIUM"
-	} else if score < 9.0 {
+	case score < 9.0:
 		return "HIGH"
+	default:
+		return "CRITICAL"
 	}
-	return "CRITICAL"
 }
 
 // ----------------------------------------------------------------------------
@@ -255,7 +257,7 @@ func processEcosystem(client *http.Client, platform string) {
 		return
 	}
 
-	var maxSeenTime time.Time = lastRunTime
+	var maxSeenTime = lastRunTime
 	var cveCount int
 
 	// SERIAL EXECUTION: Loop through zip files one by one
