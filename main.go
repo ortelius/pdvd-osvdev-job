@@ -323,6 +323,13 @@ func processEcosystem(client *http.Client, platform string) {
 	} else {
 		logger.Sugar().Infof("Completed %s. No new data.", platform)
 	}
+
+	// Trigger lifecycle tracking update for newly disclosed CVEs
+	if cveCount > 0 {
+		if err := updateLifecycleForNewCVEs(cveCount); err != nil {
+			logger.Sugar().Warnf("Failed to update lifecycle tracking after CVE updates: %v", err)
+		}
+	}
 }
 
 // newVuln persists the vulnerability
@@ -542,6 +549,359 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	}
 
 	return nil
+}
+
+// updateLifecycleForNewCVEs updates lifecycle tracking after CVE database updates
+func updateLifecycleForNewCVEs(cveUpdateCount int) error {
+	logger.Sugar().Infof("Triggering lifecycle update for %d newly disclosed CVEs", cveUpdateCount)
+
+	ctx := context.Background()
+
+	// Get all endpoints with their current releases
+	query := `
+		FOR endpoint IN endpoint
+			LET latestSync = (
+				FOR sync IN sync
+					FILTER sync.endpoint_name == endpoint.name
+					SORT sync.synced_at DESC
+					LIMIT 1
+					RETURN sync
+			)[0]
+			
+			FILTER latestSync != null
+			
+			LET activeReleases = (
+				FOR sync IN sync
+					FILTER sync.endpoint_name == endpoint.name
+					FILTER sync.synced_at == latestSync.synced_at
+					RETURN {
+						name: sync.release_name,
+						version: sync.release_version
+					}
+			)
+			
+			RETURN {
+				endpoint_name: endpoint.name,
+				releases: activeReleases,
+				last_sync_time: latestSync.synced_at
+			}
+	`
+
+	cursor, err := dbconn.Database.Query(ctx, query, nil)
+	if err != nil {
+		return fmt.Errorf("failed to query active endpoints: %w", err)
+	}
+	defer cursor.Close()
+
+	type EndpointState struct {
+		EndpointName string        `json:"endpoint_name"`
+		Releases     []ReleaseInfo `json:"releases"`
+		LastSyncTime time.Time     `json:"last_sync_time"`
+	}
+
+	processedCount := 0
+	newCVEsDetected := 0
+	errorCount := 0
+
+	for cursor.HasMore() {
+		var state EndpointState
+		if _, err := cursor.ReadDocument(ctx, &state); err != nil {
+			errorCount++
+			continue
+		}
+
+		if len(state.Releases) == 0 {
+			continue
+		}
+
+		// Get current CVEs for these releases (which are all from this endpoint)
+		currentCVEs, err := getCVEsForReleases(ctx, state.Releases)
+		if err != nil {
+			logger.Sugar().Warnf("Failed to get CVEs for endpoint %s: %v", state.EndpointName, err)
+			errorCount++
+			continue
+		}
+
+		// Get tracked CVEs from lifecycle collection
+		trackedCVEs, err := getTrackedCVEsForEndpoint(ctx, state.EndpointName)
+		if err != nil {
+			logger.Sugar().Warnf("Failed to get lifecycle CVEs for endpoint %s: %v", state.EndpointName, err)
+			errorCount++
+			continue
+		}
+
+		// Find newly-disclosed CVEs (in current but not tracked)
+		for cveKey, cveInfo := range currentCVEs {
+			if _, tracked := trackedCVEs[cveKey]; !tracked {
+				// New CVE detected! Create lifecycle record with disclosed_after_deployment=true
+				if err := createLifecycleRecord(ctx, state.EndpointName, cveInfo, state.LastSyncTime, true); err != nil {
+					logger.Sugar().Warnf("Failed to create lifecycle record for %s on %s: %v",
+						cveKey, state.EndpointName, err)
+					errorCount++
+				} else {
+					newCVEsDetected++
+					logger.Sugar().Debugf("Detected newly-disclosed CVE: %s on endpoint %s", cveInfo.CveID, state.EndpointName)
+				}
+			}
+		}
+
+		processedCount++
+	}
+
+	logger.Sugar().Infof("CVE lifecycle update complete: %d endpoints, %d new CVEs detected, %d errors",
+		processedCount, newCVEsDetected, errorCount)
+
+	return nil
+}
+
+// ReleaseInfo represents a release name and version
+type ReleaseInfo struct {
+	Name    string
+	Version string
+}
+
+// getCVEsForReleases fetches all CVEs for the given list of releases
+// Note: The releases list should be pre-filtered to a single endpoint if needed
+func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string]CVEInfo, error) {
+	result := make(map[string]CVEInfo)
+
+	for _, release := range releases {
+		cves, err := getCVEsForRelease(ctx, release.Name, release.Version)
+		if err != nil {
+			logger.Sugar().Warnf("Failed to get CVEs for release %s:%s: %v", release.Name, release.Version, err)
+			continue
+		}
+
+		for cveID, cveInfo := range cves {
+			key := fmt.Sprintf("%s:%s:%s", cveID, cveInfo.Package, release.Name)
+			result[key] = cveInfo
+		}
+	}
+
+	return result, nil
+}
+
+// getCVEsForRelease queries CVEs for a specific release
+func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) (map[string]CVEInfo, error) {
+	query := `
+		FOR release IN release
+			FILTER release.name == @name AND release.version == @version
+			LIMIT 1
+			
+			LET sbomData = (
+				FOR s IN 1..1 OUTBOUND release release2sbom
+					LIMIT 1
+					RETURN { id: s._id }
+			)[0]
+			
+			FILTER sbomData != null
+			
+			LET vulns = (
+				FOR sbomEdge IN sbom2purl
+					FILTER sbomEdge._from == sbomData.id
+					LET purl = DOCUMENT(sbomEdge._to)
+					FILTER purl != null
+					
+					FOR cveEdge IN cve2purl
+						FILTER cveEdge._to == purl._id
+						
+						// ROBUST AQL FILTER: Handles semantic version comparison
+						FILTER (
+							sbomEdge.version_major != null AND 
+							cveEdge.introduced_major != null AND 
+							(cveEdge.fixed_major != null OR cveEdge.last_affected_major != null)
+						) ? (
+							(sbomEdge.version_major > cveEdge.introduced_major OR
+							(sbomEdge.version_major == cveEdge.introduced_major AND 
+							sbomEdge.version_minor > cveEdge.introduced_minor) OR
+							(sbomEdge.version_major == cveEdge.introduced_major AND 
+							sbomEdge.version_minor == cveEdge.introduced_minor AND 
+							sbomEdge.version_patch >= cveEdge.introduced_patch))
+							AND
+							(cveEdge.fixed_major != null ? (
+								sbomEdge.version_major < cveEdge.fixed_major OR
+								(sbomEdge.version_major == cveEdge.fixed_major AND 
+								sbomEdge.version_minor < cveEdge.fixed_minor) OR
+								(sbomEdge.version_major == cveEdge.fixed_major AND 
+								sbomEdge.version_minor == cveEdge.fixed_minor AND 
+								sbomEdge.version_patch < cveEdge.fixed_patch)
+							) : (
+								sbomEdge.version_major < cveEdge.last_affected_major OR
+								(sbomEdge.version_major == cveEdge.last_affected_major AND 
+								sbomEdge.version_minor < cveEdge.last_affected_minor) OR
+								(sbomEdge.version_major == cveEdge.last_affected_major AND 
+								sbomEdge.version_minor == cveEdge.last_affected_minor AND 
+								sbomEdge.version_patch <= cveEdge.last_affected_patch)
+							))
+						) : true
+						
+						LET cve = DOCUMENT(cveEdge._from)
+						FILTER cve != null
+						
+						LET matchedAffected = (
+							FOR affected IN cve.affected != null ? cve.affected : []
+								LET cveBasePurl = affected.package.purl != null ? 
+									affected.package.purl : 
+									CONCAT("pkg:", LOWER(affected.package.ecosystem), "/", affected.package.name)
+								FILTER cveBasePurl == purl.purl
+								RETURN affected
+						)
+						FILTER LENGTH(matchedAffected) > 0
+						
+						RETURN {
+							cve_id: cve.id,
+							severity_rating: cve.database_specific.severity_rating,
+							severity_score: cve.database_specific.cvss_base_score,
+							package: purl.purl,
+							affected_version: sbomEdge.version,
+							all_affected: matchedAffected,
+							needs_validation: sbomEdge.version_major == null OR cveEdge.introduced_major == null
+						}
+			)
+			
+			RETURN vulns
+	`
+
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{
+			"name":    releaseName,
+			"version": releaseVersion,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	type VulnRaw struct {
+		CveID           string            `json:"cve_id"`
+		SeverityRating  string            `json:"severity_rating"`
+		SeverityScore   float64           `json:"severity_score"`
+		Package         string            `json:"package"`
+		AffectedVersion string            `json:"affected_version"`
+		AllAffected     []models.Affected `json:"all_affected"`
+		NeedsValidation bool              `json:"needs_validation"`
+	}
+
+	result := make(map[string]CVEInfo)
+
+	if cursor.HasMore() {
+		var vulns []VulnRaw
+		if _, err := cursor.ReadDocument(ctx, &vulns); err == nil {
+			seen := make(map[string]bool)
+			for _, v := range vulns {
+				// Conditional Go-side validation for cases AQL couldn't handle
+				if v.NeedsValidation {
+					if len(v.AllAffected) > 0 {
+						if !isVersionAffectedAny(v.AffectedVersion, v.AllAffected) {
+							continue
+						}
+					}
+				}
+
+				key := v.CveID + ":" + v.Package
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+
+				result[v.CveID] = CVEInfo{
+					CveID:          v.CveID,
+					Package:        v.Package,
+					SeverityRating: v.SeverityRating,
+					SeverityScore:  v.SeverityScore,
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// isVersionAffectedAny checks if a version is affected using Go-side validation
+func isVersionAffectedAny(version string, allAffected []models.Affected) bool {
+	for _, affected := range allAffected {
+		if util.IsVersionAffected(version, affected) {
+			return true
+		}
+	}
+	return false
+}
+
+// getTrackedCVEsForEndpoint gets all open CVEs from lifecycle collection for an endpoint
+func getTrackedCVEsForEndpoint(ctx context.Context, endpointName string) (map[string]bool, error) {
+	query := `
+		FOR record IN cve_lifecycle
+			FILTER record.endpoint_name == @endpoint_name
+			FILTER record.is_remediated == false
+			RETURN {
+				cve_id: record.cve_id,
+				package: record.package,
+				release_name: record.release_name
+			}
+	`
+
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{
+			"endpoint_name": endpointName,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	type TrackedCVE struct {
+		CveID       string `json:"cve_id"`
+		Package     string `json:"package"`
+		ReleaseName string `json:"release_name"`
+	}
+
+	result := make(map[string]bool)
+	for cursor.HasMore() {
+		var tracked TrackedCVE
+		if _, err := cursor.ReadDocument(ctx, &tracked); err == nil {
+			key := fmt.Sprintf("%s:%s:%s", tracked.CveID, tracked.Package, tracked.ReleaseName)
+			result[key] = true
+		}
+	}
+
+	return result, nil
+}
+
+// CVEInfo holds CVE information for lifecycle tracking
+type CVEInfo struct {
+	CveID          string
+	Package        string
+	SeverityRating string
+	SeverityScore  float64
+}
+
+// createLifecycleRecord creates a new CVE lifecycle tracking record
+func createLifecycleRecord(ctx context.Context, endpointName string, cveInfo CVEInfo,
+	introducedAt time.Time, disclosedAfterDeployment bool) error {
+
+	record := map[string]interface{}{
+		"cve_id":                     cveInfo.CveID,
+		"endpoint_name":              endpointName,
+		"release_name":               "", // Not available in this context
+		"package":                    cveInfo.Package,
+		"severity_rating":            cveInfo.SeverityRating,
+		"severity_score":             cveInfo.SeverityScore,
+		"introduced_at":              introducedAt,
+		"introduced_version":         "", // Not available in this context
+		"is_remediated":              false,
+		"disclosed_after_deployment": disclosedAfterDeployment,
+		"objtype":                    "CVELifecycleEvent",
+		"created_at":                 time.Now(),
+		"updated_at":                 time.Now(),
+	}
+
+	query := `INSERT @record INTO cve_lifecycle`
+	_, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"record": record},
+	})
+	return err
 }
 
 func main() {
