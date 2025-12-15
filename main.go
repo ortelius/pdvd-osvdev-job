@@ -4,7 +4,9 @@
 // CRITICAL FIXES APPLIED:
 // 1. Added Materialized Edge updating (release2cve) for instant lookups
 // 2. Maintained robust version validation (AQL + Go-side)
-// 3. Fixed "unused variable" error by restoring debug logger in getCVEsForRelease
+// 3. Fixed cve_lifecycle tracking:
+//   - Now uses UPSERT to handle updates idempotently
+//   - Enforces "Once Post-Deploy, Always Post-Deploy" logic
 package main
 
 import (
@@ -765,32 +767,33 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 			continue
 		}
 
-		// Get tracked CVEs from lifecycle collection
-		trackedCVEs, err := getTrackedCVEsForEndpoint(ctx, state.EndpointName)
-		if err != nil {
-			logger.Sugar().Warnf("Failed to get lifecycle CVEs for endpoint %s: %v", state.EndpointName, err)
-			errorCount++
-			continue
-		}
+		// Iterate over ALL active CVEs and UPSERT them
+		// This ensures we refresh the updated_at timestamp and enforce the Post-Deployment flag logic
+		for cveID, cveInfo := range currentCVEs {
+			// DYNAMICALLY calculate Post-Deployment status
+			// If CVE published AFTER the endpoint sync, it is a post-deployment risk
+			disclosedAfterDeployment := false
+			if !cveInfo.Published.IsZero() {
+				disclosedAfterDeployment = cveInfo.Published.After(state.LastSyncTime)
+			}
 
-		// Find newly-disclosed CVEs (in current but not tracked)
-		for cveKey, cveInfo := range currentCVEs {
-			if _, tracked := trackedCVEs[cveKey]; !tracked {
-				if err := createLifecycleRecord(ctx, state.EndpointName, cveInfo, state.LastSyncTime, true); err != nil {
-					logger.Sugar().Warnf("Failed to create lifecycle record for %s on %s: %v",
-						cveKey, state.EndpointName, err)
-					errorCount++
-				} else {
-					newCVEsDetected++
-					logger.Sugar().Debugf("Detected newly-disclosed CVE: %s on endpoint %s", cveInfo.CveID, state.EndpointName)
-				}
+			// Upsert record: Insert if new, Update if exists
+			// The DB query handles strict logic: OLD.flag || NEW.flag
+			if err := createLifecycleRecord(ctx, state.EndpointName, cveInfo, state.LastSyncTime, disclosedAfterDeployment); err != nil {
+				logger.Sugar().Warnf("Failed to upsert lifecycle record for %s on %s: %v",
+					cveID, state.EndpointName, err)
+				errorCount++
+			} else {
+				// We don't distinguish "new" from "updated" here easily without DB return,
+				// but effectively we are confirming the CVE is detected.
+				newCVEsDetected++
 			}
 		}
 
 		processedCount++
 	}
 
-	logger.Sugar().Infof("CVE lifecycle update complete: %d endpoints, %d new CVEs detected, %d errors",
+	logger.Sugar().Infof("CVE lifecycle update complete: %d endpoints processed, %d active CVEs confirmed/added, %d errors",
 		processedCount, newCVEsDetected, errorCount)
 
 	return nil
@@ -817,6 +820,11 @@ func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string
 
 		for cveID, cveInfo := range cves {
 			key := fmt.Sprintf("%s:%s:%s", cveID, cveInfo.Package, release.Name)
+
+			// Populate Release information now that we know which release context we are in
+			cveInfo.ReleaseName = release.Name
+			cveInfo.ReleaseVersion = release.Version
+
 			result[key] = cveInfo
 		}
 	}
@@ -893,6 +901,7 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 						
 						RETURN {
 							cve_id: cve.id,
+							published: cve.published, // ADDED: Return published date
 							severity_rating: cve.database_specific.severity_rating,
 							severity_score: cve.database_specific.cvss_base_score,
 							package: purl.purl,
@@ -918,6 +927,7 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 
 	type VulnRaw struct {
 		CveID           string            `json:"cve_id"`
+		Published       string            `json:"published"` // ADDED: String capture
 		SeverityRating  string            `json:"severity_rating"`
 		SeverityScore   float64           `json:"severity_score"`
 		Package         string            `json:"package"`
@@ -927,14 +937,12 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 	}
 
 	result := make(map[string]CVEInfo)
-	totalFromQuery := 0
 	filteredByValidation := 0
 	deduplicated := 0
 
 	if cursor.HasMore() {
 		var vulns []VulnRaw
 		if _, err := cursor.ReadDocument(ctx, &vulns); err == nil {
-			totalFromQuery = len(vulns)
 			seen := make(map[string]bool)
 
 			for _, v := range vulns {
@@ -961,19 +969,30 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 				}
 				seen[key] = true
 
+				// Parse Published Date
+				var publishedTime time.Time
+				if v.Published != "" {
+					// OSV.dev published dates are usually RFC3339
+					if t, err := time.Parse(time.RFC3339, v.Published); err == nil {
+						publishedTime = t
+					} else {
+						// Try parsing without timezone if standard fails (fallback)
+						if t, err := time.Parse("2006-01-02T15:04:05", v.Published); err == nil {
+							publishedTime = t
+						}
+					}
+				}
+
 				result[v.CveID] = CVEInfo{
 					CveID:          v.CveID,
 					Package:        v.Package,
 					SeverityRating: v.SeverityRating,
 					SeverityScore:  v.SeverityScore,
+					Published:      publishedTime, // ADDED
 				}
 			}
 		}
 	}
-
-	// Debug logging to track filtering
-	logger.Sugar().Debugf("Release %s:%s - CVEs from query: %d, filtered by validation: %d, deduplicated: %d, final: %d",
-		releaseName, releaseVersion, totalFromQuery, filteredByValidation, deduplicated, len(result))
 
 	return result, nil
 }
@@ -988,68 +1007,33 @@ func isVersionAffectedAny(version string, allAffected []models.Affected) bool {
 	return false
 }
 
-// getTrackedCVEsForEndpoint gets all open CVEs from lifecycle collection for an endpoint
-func getTrackedCVEsForEndpoint(ctx context.Context, endpointName string) (map[string]bool, error) {
-	query := `
-		FOR record IN cve_lifecycle
-			FILTER record.endpoint_name == @endpoint_name
-			FILTER record.is_remediated == false
-			RETURN {
-				cve_id: record.cve_id,
-				package: record.package,
-				release_name: record.release_name
-			}
-	`
-
-	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
-		BindVars: map[string]interface{}{
-			"endpoint_name": endpointName,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close()
-
-	type TrackedCVE struct {
-		CveID       string `json:"cve_id"`
-		Package     string `json:"package"`
-		ReleaseName string `json:"release_name"`
-	}
-
-	result := make(map[string]bool)
-	for cursor.HasMore() {
-		var tracked TrackedCVE
-		if _, err := cursor.ReadDocument(ctx, &tracked); err == nil {
-			key := fmt.Sprintf("%s:%s:%s", tracked.CveID, tracked.Package, tracked.ReleaseName)
-			result[key] = true
-		}
-	}
-
-	return result, nil
-}
-
 // CVEInfo holds CVE information for lifecycle tracking
 type CVEInfo struct {
 	CveID          string
 	Package        string
 	SeverityRating string
 	SeverityScore  float64
+	Published      time.Time // ADDED: Critical for post-deployment logic
+	ReleaseName    string    // ADDED: Context for lifecycle
+	ReleaseVersion string    // ADDED: Context for lifecycle
 }
 
-// createLifecycleRecord creates a new CVE lifecycle tracking record
+// createLifecycleRecord upserts a CVE lifecycle tracking record
+// It ensures that once a CVE is flagged as Post-Deployment (disclosed_after_deployment=true),
+// it remains so, even if a subsequent sync (deployment) would calculate it as false.
 func createLifecycleRecord(ctx context.Context, endpointName string, cveInfo CVEInfo,
 	introducedAt time.Time, disclosedAfterDeployment bool) error {
 
 	record := map[string]interface{}{
 		"cve_id":                     cveInfo.CveID,
 		"endpoint_name":              endpointName,
-		"release_name":               "", // Not available in this context
+		"release_name":               cveInfo.ReleaseName,
 		"package":                    cveInfo.Package,
 		"severity_rating":            cveInfo.SeverityRating,
 		"severity_score":             cveInfo.SeverityScore,
 		"introduced_at":              introducedAt,
-		"introduced_version":         "", // Not available in this context
+		"published":                  cveInfo.Published,
+		"introduced_version":         cveInfo.ReleaseVersion,
 		"is_remediated":              false,
 		"disclosed_after_deployment": disclosedAfterDeployment,
 		"objtype":                    "CVELifecycleEvent",
@@ -1057,7 +1041,28 @@ func createLifecycleRecord(ctx context.Context, endpointName string, cveInfo CVE
 		"updated_at":                 time.Now(),
 	}
 
-	query := `INSERT @record INTO cve_lifecycle`
+	// UPSERT logic:
+	// 1. MATCH: Find existing record by CVE, Endpoint, Service, and Package
+	// 2. INSERT: If not found, create new record
+	// 3. UPDATE: If found, update timestamps and ENFORCE flag logic
+	//    Logic: OLD.flag || NEW.flag
+	//    - If OLD was true, it stays true (true || false = true)
+	//    - If OLD was false, it can become true (false || true = true)
+	//    - It can never go from true to false
+	query := `
+		UPSERT { 
+			cve_id: @record.cve_id, 
+			endpoint_name: @record.endpoint_name, 
+			release_name: @record.release_name, 
+			package: @record.package 
+		} 
+		INSERT @record 
+		UPDATE { 
+			updated_at: DATE_NOW(), 
+			disclosed_after_deployment: OLD.disclosed_after_deployment || @record.disclosed_after_deployment 
+		} 
+		IN cve_lifecycle
+	`
 	_, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
 		BindVars: map[string]interface{}{"record": record},
 	})
