@@ -2,9 +2,9 @@
 // Runs as a cronjob
 //
 // CRITICAL FIXES APPLIED:
-// 1. Added missing Go-side validation in getCVEsForRelease (lines 790-798)
-// 2. Added debug logging to track filtering stages
-// 3. Fixed edge case where all_affected validation was being skipped
+// 1. Added Materialized Edge updating (release2cve) for instant lookups
+// 2. Maintained robust version validation (AQL + Go-side)
+// 3. Fixed "unused variable" error by restoring debug logger in getCVEsForRelease
 package main
 
 import (
@@ -238,7 +238,8 @@ func LoadFromOSVDev() {
 		totalCVEsUpdated += cveCount
 	}
 
-	// MOVED HERE: Trigger lifecycle tracking update ONCE after all CVEs are loaded
+	// Trigger lifecycle tracking update ONCE after all CVEs are loaded
+	// This maintains the cve_lifecycle table for MTTR metrics
 	if totalCVEsUpdated > 0 {
 		logger.Sugar().Infof("All ecosystems processed. Total CVEs updated: %d. Running lifecycle tracking...", totalCVEsUpdated)
 		if err := updateLifecycleForNewCVEs(totalCVEsUpdated); err != nil {
@@ -285,8 +286,6 @@ func processEcosystem(client *http.Client, platform string) int {
 			continue
 		}
 
-		// Use anonymous function to ensure 'defer rc.Close()' runs immediately after file processing,
-		// preventing file descriptor exhaustion in a serial loop.
 		func() {
 			rc, err := f.Open()
 			if err != nil {
@@ -304,12 +303,9 @@ func processEcosystem(client *http.Client, platform string) int {
 			if modStr != "" {
 				modTime, err := time.Parse(time.RFC3339, modStr)
 				if err == nil {
-					// Update maxSeenTime (No Mutex needed in serial mode)
 					if modTime.After(maxSeenTime) {
 						maxSeenTime = modTime
 					}
-
-					// If this vuln is older than our last run, SKIP IT
 					if !modTime.After(lastRunTime) {
 						return
 					}
@@ -323,12 +319,18 @@ func processEcosystem(client *http.Client, platform string) int {
 			}
 			if wasUpdated {
 				cveCount++
+				// OPTION 2: Trigger Materialized Edge Update for this CVE
+				// This finds all existing releases affected by this new/updated CVE
+				if cveKey, ok := content["_key"].(string); ok {
+					if err := updateReleaseEdgesForCVE(context.Background(), cveKey); err != nil {
+						logger.Sugar().Errorf("Failed to update release edges for CVE %s: %v", cveKey, err)
+					}
+				}
 			}
 		}()
 	}
 
 	// 4. Save High Water Mark to database
-	// Default to NOW if no new timestamps were found
 	if maxSeenTime.IsZero() {
 		maxSeenTime = time.Now().UTC()
 	}
@@ -343,7 +345,6 @@ func processEcosystem(client *http.Client, platform string) int {
 		logger.Sugar().Infof("Completed %s. No new data.", platform)
 	}
 
-	// Return CVE count for aggregation
 	return cveCount
 }
 
@@ -566,6 +567,133 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	return nil
 }
 
+// updateReleaseEdgesForCVE is the Reverse Lookup function for Option 2
+// It finds all releases affected by the given CVE and creates/updates the release2cve edges
+func updateReleaseEdgesForCVE(ctx context.Context, cveKey string) error {
+	cveID := "cve/" + cveKey
+
+	// 1. Cleanup old edges for this CVE
+	// Note: We filter by _to because release2cve is Release -> CVE
+	cleanupQuery := `
+		FOR edge IN release2cve
+			FILTER edge._to == @cveID
+			REMOVE edge IN release2cve
+	`
+	if _, err := dbconn.Database.Query(ctx, cleanupQuery, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"cveID": cveID},
+	}); err != nil {
+		return err
+	}
+
+	// 2. Find Candidates using Robust AQL Filter
+	// We traverse from CVE -> PURL -> SBOM -> Release
+	query := `
+		FOR cve IN cve
+			FILTER cve._key == @cveKey
+			
+			// 1. Find PURLs linked to this CVE
+			FOR cveEdge IN cve2purl
+				FILTER cveEdge._from == cve._id
+				
+				// 2. Find SBOMs that use this PURL (Reverse Lookup)
+				FOR sbomEdge IN sbom2purl
+					FILTER sbomEdge._to == cveEdge._to
+					
+					// 3. Robust AQL Version Filter (Copied from existing logic)
+					FILTER (
+						sbomEdge.version_major != null AND 
+						cveEdge.introduced_major != null AND 
+						(cveEdge.fixed_major != null OR cveEdge.last_affected_major != null)
+					) ? (
+						(sbomEdge.version_major > cveEdge.introduced_major OR
+						(sbomEdge.version_major == cveEdge.introduced_major AND 
+						sbomEdge.version_minor > cveEdge.introduced_minor) OR
+						(sbomEdge.version_major == cveEdge.introduced_major AND 
+						sbomEdge.version_minor == cveEdge.introduced_minor AND 
+						sbomEdge.version_patch >= cveEdge.introduced_patch))
+						AND
+						(cveEdge.fixed_major != null ? (
+							sbomEdge.version_major < cveEdge.fixed_major OR
+							(sbomEdge.version_major == cveEdge.fixed_major AND 
+							sbomEdge.version_minor < cveEdge.fixed_minor) OR
+							(sbomEdge.version_major == cveEdge.fixed_major AND 
+							sbomEdge.version_minor == cveEdge.fixed_minor AND 
+							sbomEdge.version_patch < cveEdge.fixed_patch)
+						) : (
+							sbomEdge.version_major < cveEdge.last_affected_major OR
+							(sbomEdge.version_major == cveEdge.last_affected_major AND 
+							sbomEdge.version_minor < cveEdge.last_affected_minor) OR
+							(sbomEdge.version_major == cveEdge.last_affected_major AND 
+							sbomEdge.version_minor == cveEdge.last_affected_minor AND 
+							sbomEdge.version_patch <= cveEdge.last_affected_patch)
+						))
+					) : true
+					
+					// 4. Find the Release that owns this SBOM
+					FOR release IN 1..1 INBOUND sbomEdge._from release2sbom
+					
+						RETURN {
+							release_id: release._id,
+							package_purl: sbomEdge.full_purl,
+							package_version: sbomEdge.version,
+							all_affected: cve.affected,
+							needs_validation: sbomEdge.version_major == null OR cveEdge.introduced_major == null
+						}
+	`
+
+	cursor, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"cveKey": cveKey},
+	})
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+
+	var edgesToInsert []map[string]interface{}
+	type Candidate struct {
+		ReleaseID       string            `json:"release_id"`
+		PackagePurl     string            `json:"package_purl"`
+		PackageVersion  string            `json:"package_version"`
+		AllAffected     []models.Affected `json:"all_affected"`
+		NeedsValidation bool              `json:"needs_validation"`
+	}
+
+	for cursor.HasMore() {
+		var cand Candidate
+		if _, err := cursor.ReadDocument(ctx, &cand); err != nil {
+			continue
+		}
+
+		// Perform Go-side validation if DB couldn't confirm
+		if cand.NeedsValidation {
+			if !isVersionAffectedAny(cand.PackageVersion, cand.AllAffected) {
+				continue
+			}
+		}
+
+		// Prepare Materialized Edge
+		edgesToInsert = append(edgesToInsert, map[string]interface{}{
+			"_from":           cand.ReleaseID,
+			"_to":             cveID,
+			"type":            "static_analysis",
+			"package_purl":    cand.PackagePurl,
+			"package_version": cand.PackageVersion,
+			"created_at":      time.Now(),
+		})
+	}
+
+	// 3. Batch Insert Edges
+	if len(edgesToInsert) > 0 {
+		query := `FOR edge IN @edges INSERT edge INTO release2cve`
+		_, err := dbconn.Database.Query(ctx, query, &arangodb.QueryOptions{
+			BindVars: map[string]interface{}{"edges": edgesToInsert},
+		})
+		return err
+	}
+
+	return nil
+}
+
 // updateLifecycleForNewCVEs updates lifecycle tracking after CVE database updates
 func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 	logger.Sugar().Infof("Triggering lifecycle update for %d newly disclosed CVEs", cveUpdateCount)
@@ -629,7 +757,7 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 			continue
 		}
 
-		// Get current CVEs for these releases (which are all from this endpoint)
+		// Get current CVEs for these releases
 		currentCVEs, err := getCVEsForReleases(ctx, state.Releases)
 		if err != nil {
 			logger.Sugar().Warnf("Failed to get CVEs for endpoint %s: %v", state.EndpointName, err)
@@ -648,7 +776,6 @@ func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 		// Find newly-disclosed CVEs (in current but not tracked)
 		for cveKey, cveInfo := range currentCVEs {
 			if _, tracked := trackedCVEs[cveKey]; !tracked {
-				// New CVE detected! Create lifecycle record with disclosed_after_deployment=true
 				if err := createLifecycleRecord(ctx, state.EndpointName, cveInfo, state.LastSyncTime, true); err != nil {
 					logger.Sugar().Warnf("Failed to create lifecycle record for %s on %s: %v",
 						cveKey, state.EndpointName, err)
@@ -676,11 +803,12 @@ type ReleaseInfo struct {
 }
 
 // getCVEsForReleases fetches all CVEs for the given list of releases
-// Note: The releases list should be pre-filtered to a single endpoint if needed
 func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string]CVEInfo, error) {
 	result := make(map[string]CVEInfo)
 
 	for _, release := range releases {
+		// Optimization: This could also use release2cve edges now, but for lifecycle tracking
+		// using the existing method ensures consistency during the transition.
 		cves, err := getCVEsForRelease(ctx, release.Name, release.Version)
 		if err != nil {
 			logger.Sugar().Warnf("Failed to get CVEs for release %s:%s: %v", release.Name, release.Version, err)
@@ -720,7 +848,7 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 					FOR cveEdge IN cve2purl
 						FILTER cveEdge._to == purl._id
 						
-						// ROBUST AQL FILTER: Handles semantic version comparison
+						// ROBUST AQL FILTER
 						FILTER (
 							sbomEdge.version_major != null AND 
 							cveEdge.introduced_major != null AND 
@@ -810,9 +938,6 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 			seen := make(map[string]bool)
 
 			for _, v := range vulns {
-				// LOGIC UPDATE: Trust AQL results unless validation is explicitly needed.
-				// This prevents valid matches from being dropped due to strict Go-side checks
-				// on data that the DB has already confirmed is a match.
 				if v.NeedsValidation {
 					if len(v.AllAffected) > 0 {
 						if !isVersionAffectedAny(v.AffectedVersion, v.AllAffected) {
@@ -822,7 +947,6 @@ func getCVEsForRelease(ctx context.Context, releaseName, releaseVersion string) 
 							continue
 						}
 					} else {
-						// If validation is required but we lack the data to do it, we must skip.
 						logger.Sugar().Warnf("CVE %s for package %s needs validation but has no all_affected data - skipping",
 							v.CveID, v.Package)
 						filteredByValidation++
