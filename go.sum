@@ -51,6 +51,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/ortelius/pdvd-backend/v12 v12.0.129 h1:Et27+RSKOVJImDnaKFj0tPqO7Tpxfm9BzCdQk7qWLUY=
 github.com/ortelius/pdvd-backend/v12 v12.0.129/go.mod h1:X1WFkXZ9Qit0wt0MFzUXfpDcGRDaXAYIBew9WdZJWwQ=
+github.com/ortelius/pdvd-backend/v12 v12.0.141 h1:dWuNIpKisdaNe2fjHjXkT3H8eeiZqh6ejusogo3u79E=
+github.com/ortelius/pdvd-backend/v12 v12.0.141/go.mod h1:ok6QL+OuJ7bZdnWyOB+xH8Y6wsj7JQMMDQvNPvcdGBg=
 github.com/package-url/packageurl-go v0.1.3 h1:4juMED3hHiz0set3Vq3KeQ75KD1avthoXLtmE3I0PLs=
 github.com/package-url/packageurl-go v0.1.3/go.mod h1:nKAWB8E6uk1MHqiS/lQb9pYBGH2+mdJ2PJc2s50dQY0=
 github.com/pandatix/go-cvss v0.6.2 h1:TFiHlzUkT67s6UkelHmK6s1INKVUG7nlKYiWWDTITGI=
