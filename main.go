@@ -195,26 +195,29 @@ func newVuln(content map[string]interface{}) (bool, error) {
 		return false, fmt.Errorf("missing CVE ID")
 	}
 
-	// Use sanitized key
+	// 1. Generate the sanitized key (e.g., "CVE-2024-1234")
 	cveKey := util.SanitizeKey(cveID)
+
+	// 2. CRITICAL FIX: Explicitly set the _key so it matches what processEdges and traversals expect
+	content["_key"] = cveKey
 	content["objtype"] = "CVE"
 
-	// UPSERT: Insert if new, update if exists
+	// 3. UPSERT: Attempt to create. If it fails due to conflict, update the existing document.
 	_, err := dbconn.Collections["cve"].CreateDocument(ctx, content)
 	if err != nil {
-		// If exists, update
+		// If the document already exists, update it using the explicit cveKey
 		_, err = dbconn.Collections["cve"].UpdateDocument(ctx, cveKey, content)
 		if err != nil {
 			return false, err
 		}
 	}
 
-	// Process edges (PURL relationships)
+	// 4. Process edges (PURL relationships) - these will now point to the correct ID
 	if err := processEdges(ctx, content); err != nil {
 		return false, err
 	}
 
-	// Update release2cve materialized edges
+	// 5. Update release2cve materialized edges - the AQL join will now succeed
 	if err := updateReleaseEdgesForCVE(ctx, cveKey); err != nil {
 		logger.Sugar().Warnf("Failed to update release edges for %s: %v", cveID, err)
 	}
@@ -554,7 +557,7 @@ type ReleaseInfo struct {
 // Note: Using lifecycle.CVEInfo from shared package
 // type CVEInfo is defined in restapi/modules/lifecycle/handlers.go
 
-func updateLifecycleForNewCVEs(_ int) error {
+func updateLifecycleForNewCVEs(cveUpdateCount int) error {
 	ctx := context.Background()
 
 	// Get all active deployments (syncs) with their sync timestamps
