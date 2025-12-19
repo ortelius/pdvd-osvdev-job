@@ -1,3 +1,5 @@
+// Ortelius v11 Vulnerability Microservice that handles creating Vulnerability from OSV.dev
+// Runs as a cronjob
 package main
 
 import (
