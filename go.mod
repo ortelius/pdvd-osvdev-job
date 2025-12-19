@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/arangodb/go-driver/v2 v2.1.6
-	github.com/ortelius/pdvd-backend/v12 v12.0.171
+	github.com/ortelius/pdvd-backend/v12 v12.0.175
 )
 
 require (
