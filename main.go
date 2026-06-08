@@ -260,31 +260,13 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			continue
 		}
 
-		pkgMap, ok := affMap["package"].(map[string]interface{})
-		if !ok {
+		// ── Tiered PURL resolution ────────────────────────────────────────────
+		basePurl := resolvePURL(affMap, content)
+		if basePurl == "" {
+			logger.Sugar().Warnf("Could not resolve PURL for CVE %s, skipping affected entry", cveID)
 			continue
 		}
-
-		// BACKEND CONSISTENCY: Use centralized PURL standardization
-		var basePurl string
-		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
-			cleaned, err := util.CleanPURL(purl)
-			if err != nil {
-				continue
-			}
-			basePurl, err = util.GetStandardBasePURL(cleaned)
-			if err != nil {
-				continue
-			}
-		} else {
-			ecosystem, _ := pkgMap["ecosystem"].(string)
-			namespace, _ := pkgMap["namespace"].(string)
-			name, _ := pkgMap["name"].(string)
-			if ecosystem == "" || name == "" {
-				continue
-			}
-			basePurl = util.GetBasePURLFromComponents(ecosystem, namespace, name)
-		}
+		// ─────────────────────────────────────────────────────────────────────
 
 		// Create PURL hub node
 		purlKey := util.SanitizeKey(basePurl)
@@ -295,9 +277,9 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 		}
 
 		purlUpsertQuery := `
-			UPSERT { _key: @key } 
-			INSERT @doc 
-			UPDATE {} 
+			UPSERT { _key: @key }
+			INSERT @doc
+			UPDATE {}
 			IN purl
 		`
 		dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
@@ -322,6 +304,13 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			}
 
 			rangeType, _ := rangeMap["type"].(string)
+
+			// Skip GIT ranges — we use SEMVER for version matching.
+			// GIT ranges were only used for PURL resolution above.
+			if rangeType == "GIT" {
+				continue
+			}
+
 			events, _ := rangeMap["events"].([]interface{})
 
 			// Extract version events
@@ -371,7 +360,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			if introducedParsed.Patch != nil {
 				edge["introduced_patch"] = *introducedParsed.Patch
 			}
-
 			if fixedParsed.Major != nil {
 				edge["fixed_major"] = *fixedParsed.Major
 			}
@@ -381,7 +369,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			if fixedParsed.Patch != nil {
 				edge["fixed_patch"] = *fixedParsed.Patch
 			}
-
 			if lastAffectedParsed.Major != nil {
 				edge["last_affected_major"] = *lastAffectedParsed.Major
 			}
@@ -395,8 +382,9 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			// Check if edge already exists
 			checkEdgeQuery := `
 				FOR e IN cve2purl
-					FILTER e._from == @from 
+					FILTER e._from == @from
 					   AND e._to == @to
+					   AND e.type == @type
 					LIMIT 1
 					RETURN e
 			`
@@ -404,6 +392,7 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				BindVars: map[string]interface{}{
 					"from": cveDocID,
 					"to":   purlDocID,
+					"type": rangeType,
 				},
 			})
 			if err != nil {
@@ -423,6 +412,91 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	}
 
 	return nil
+}
+
+// ============================================================================
+// Tiered PURL Resolution
+// ============================================================================
+
+// resolvePURL attempts to determine a base PURL for an affected entry using
+// a four-tier fallback strategy:
+//
+//  1. affected.package.purl         — explicit PURL (most ecosystems)
+//  2. affected.package.ecosystem    — synthesise from ecosystem + name
+//  3. affected.ranges[GIT].repo     — synthesise pkg:github from repo URL (C/C++)
+//  4. database_specific.package     — last resort pkg:generic
+func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) string {
+	// Tier 1 & 2 — package block present
+	if pkgMap, ok := affMap["package"].(map[string]interface{}); ok {
+		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
+			// Tier 1: explicit purl
+			cleaned, err := util.CleanPURL(purl)
+			if err != nil {
+				return ""
+			}
+			basePurl, err := util.GetStandardBasePURL(cleaned)
+			if err != nil {
+				return ""
+			}
+			return basePurl
+		}
+
+		// Tier 2: synthesise from ecosystem + name
+		ecosystem, _ := pkgMap["ecosystem"].(string)
+		namespace, _ := pkgMap["namespace"].(string)
+		name, _ := pkgMap["name"].(string)
+		if ecosystem != "" && name != "" {
+			return util.GetBasePURLFromComponents(ecosystem, namespace, name)
+		}
+	}
+
+	// Tier 3 — extract pkg:github from GIT range repo URL
+	// e.g. "https://github.com/curl/curl.git" → "pkg:github/curl/curl"
+	if ranges, ok := affMap["ranges"].([]interface{}); ok {
+		for _, rangeItem := range ranges {
+			rangeMap, ok := rangeItem.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if rangeMap["type"] != "GIT" {
+				continue
+			}
+			repo, _ := rangeMap["repo"].(string)
+			if purl := githubRepoToPURL(repo); purl != "" {
+				return purl
+			}
+		}
+	}
+
+	// Tier 4 — database_specific.package as pkg:generic last resort
+	if dbSpecific, ok := content["database_specific"].(map[string]interface{}); ok {
+		if pkgName, ok := dbSpecific["package"].(string); ok && pkgName != "" {
+			logger.Sugar().Warnf("Using pkg:generic fallback for package %q — consider improving OSV record", pkgName)
+			return "pkg:generic/" + strings.ToLower(pkgName)
+		}
+	}
+
+	return ""
+}
+
+// githubRepoToPURL converts a GitHub repository URL to a pkg:github PURL.
+// "https://github.com/curl/curl.git" → "pkg:github/curl/curl"
+func githubRepoToPURL(repoURL string) string {
+	repoURL = strings.TrimSuffix(repoURL, ".git")
+	repoURL = strings.TrimSuffix(repoURL, "/")
+
+	const githubPrefix = "https://github.com/"
+	if !strings.HasPrefix(repoURL, githubPrefix) {
+		return ""
+	}
+
+	path := strings.TrimPrefix(repoURL, githubPrefix)
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("pkg:github/%s/%s", parts[0], parts[1])
 }
 
 // ============================================================================
