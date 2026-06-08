@@ -240,10 +240,84 @@ func newVuln(content map[string]interface{}) (bool, error) {
 	return true, nil
 }
 
-// ============================================================================
-// CVE to PURL Hub Edge Processing
-// ============================================================================
+// githubRepoToPURL converts a GitHub repository URL to a pkg:github PURL.
+// "https://github.com/curl/curl.git" → "pkg:github/curl/curl"
+func githubRepoToPURL(repoURL string) string {
+	repoURL = strings.TrimSuffix(strings.TrimSuffix(repoURL, "/"), ".git")
 
+	const githubPrefix = "https://github.com/"
+	if !strings.HasPrefix(repoURL, githubPrefix) {
+		return ""
+	}
+
+	parts := strings.Split(strings.TrimPrefix(repoURL, githubPrefix), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("pkg:github/%s/%s", parts[0], parts[1])
+}
+
+// resolvePURL attempts to determine a base PURL for an affected entry using
+// a four-tier fallback strategy:
+//
+//  1. affected.package.purl         — explicit PURL (most ecosystems)
+//  2. affected.package.ecosystem    — synthesise from ecosystem + name
+//  3. affected.ranges[GIT].repo     — synthesise pkg:github from repo URL (C/C++)
+//  4. database_specific.package     — last resort pkg:generic
+func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) string {
+	// Tier 1 & 2 — package block present
+	if pkgMap, ok := affMap["package"].(map[string]interface{}); ok {
+		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
+			cleaned, err := util.CleanPURL(purl)
+			if err != nil {
+				return ""
+			}
+			basePurl, err := util.GetStandardBasePURL(cleaned)
+			if err != nil {
+				return ""
+			}
+			return basePurl
+		}
+
+		ecosystem, _ := pkgMap["ecosystem"].(string)
+		namespace, _ := pkgMap["namespace"].(string)
+		name, _ := pkgMap["name"].(string)
+		if ecosystem != "" && name != "" {
+			return util.GetBasePURLFromComponents(ecosystem, namespace, name)
+		}
+	}
+
+	// Tier 3 — find the first GIT range and extract repo URL
+	if ranges, ok := affMap["ranges"].([]interface{}); ok {
+		for _, rangeItem := range ranges {
+			rangeMap, ok := rangeItem.(map[string]interface{})
+			if !ok || rangeMap["type"] != "GIT" {
+				continue
+			}
+			if repo, ok := rangeMap["repo"].(string); ok {
+				if purl := githubRepoToPURL(repo); purl != "" {
+					return purl
+				}
+			}
+			break // only need the first GIT range
+		}
+	}
+
+	// Tier 4 — database_specific.package as pkg:generic last resort
+	if dbSpecific, ok := content["database_specific"].(map[string]interface{}); ok {
+		if pkgName, ok := dbSpecific["package"].(string); ok && pkgName != "" {
+			logger.Sugar().Warnf("Using pkg:generic fallback for package %q — consider improving OSV record", pkgName)
+			return "pkg:generic/" + strings.ToLower(pkgName)
+		}
+	}
+
+	return ""
+}
+
+// processEdges populates purl hub nodes and cve2purl edges.
+// Only SEMVER ranges are stored — GIT ranges are skipped as commit SHAs
+// cannot be used for semver version range matching.
 func processEdges(ctx context.Context, content map[string]interface{}) error {
 	cveID, _ := content["id"].(string)
 	cveKey := util.SanitizeKey(cveID)
@@ -260,15 +334,12 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			continue
 		}
 
-		// ── Tiered PURL resolution ────────────────────────────────────────────
 		basePurl := resolvePURL(affMap, content)
 		if basePurl == "" {
 			logger.Sugar().Warnf("Could not resolve PURL for CVE %s, skipping affected entry", cveID)
 			continue
 		}
-		// ─────────────────────────────────────────────────────────────────────
 
-		// Create PURL hub node
 		purlKey := util.SanitizeKey(basePurl)
 		purlNode := map[string]interface{}{
 			"_key":    purlKey,
@@ -291,7 +362,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 
 		purlDocID := "purl/" + purlKey
 
-		// Process version ranges
 		ranges, _ := affMap["ranges"].([]interface{})
 		if len(ranges) == 0 {
 			continue
@@ -305,29 +375,28 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 
 			rangeType, _ := rangeMap["type"].(string)
 
-			// Skip GIT ranges — we use SEMVER for version matching.
-			// GIT ranges were only used for PURL resolution above.
-			if rangeType == "GIT" {
+			// Only process SEMVER ranges — GIT ranges use commit SHAs
+			// which cannot be used for semver version matching
+			if rangeType != "SEMVER" {
 				continue
 			}
 
 			events, _ := rangeMap["events"].([]interface{})
 
-			// Extract version events
 			var introduced, fixed, lastAffected string
 			for _, eventItem := range events {
 				eventMap, ok := eventItem.(map[string]interface{})
 				if !ok {
 					continue
 				}
-				if introVal, ok := eventMap["introduced"].(string); ok {
-					introduced = introVal
+				if v, ok := eventMap["introduced"].(string); ok {
+					introduced = v
 				}
-				if fixedVal, ok := eventMap["fixed"].(string); ok {
-					fixed = fixedVal
+				if v, ok := eventMap["fixed"].(string); ok {
+					fixed = v
 				}
-				if laVal, ok := eventMap["last_affected"].(string); ok {
-					lastAffected = laVal
+				if v, ok := eventMap["last_affected"].(string); ok {
+					lastAffected = v
 				}
 			}
 
@@ -335,12 +404,10 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				introduced = "0"
 			}
 
-			// Parse semantic versions for fast range checking
 			introducedParsed := util.ParseSemanticVersion(introduced)
 			fixedParsed := util.ParseSemanticVersion(fixed)
 			lastAffectedParsed := util.ParseSemanticVersion(lastAffected)
 
-			// Build edge with version metadata
 			edge := map[string]interface{}{
 				"_from":         cveDocID,
 				"_to":           purlDocID,
@@ -350,7 +417,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				"last_affected": lastAffected,
 			}
 
-			// Add parsed version components for fast AQL range queries
 			if introducedParsed.Major != nil {
 				edge["introduced_major"] = *introducedParsed.Major
 			}
@@ -379,12 +445,10 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				edge["last_affected_patch"] = *lastAffectedParsed.Patch
 			}
 
-			// Check if edge already exists
 			checkEdgeQuery := `
 				FOR e IN cve2purl
 					FILTER e._from == @from
 					   AND e._to == @to
-					   AND e.type == @type
 					LIMIT 1
 					RETURN e
 			`
@@ -392,7 +456,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				BindVars: map[string]interface{}{
 					"from": cveDocID,
 					"to":   purlDocID,
-					"type": rangeType,
 				},
 			})
 			if err != nil {
@@ -412,91 +475,6 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 	}
 
 	return nil
-}
-
-// ============================================================================
-// Tiered PURL Resolution
-// ============================================================================
-
-// resolvePURL attempts to determine a base PURL for an affected entry using
-// a four-tier fallback strategy:
-//
-//  1. affected.package.purl         — explicit PURL (most ecosystems)
-//  2. affected.package.ecosystem    — synthesise from ecosystem + name
-//  3. affected.ranges[GIT].repo     — synthesise pkg:github from repo URL (C/C++)
-//  4. database_specific.package     — last resort pkg:generic
-func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) string {
-	// Tier 1 & 2 — package block present
-	if pkgMap, ok := affMap["package"].(map[string]interface{}); ok {
-		if purl, ok := pkgMap["purl"].(string); ok && purl != "" {
-			// Tier 1: explicit purl
-			cleaned, err := util.CleanPURL(purl)
-			if err != nil {
-				return ""
-			}
-			basePurl, err := util.GetStandardBasePURL(cleaned)
-			if err != nil {
-				return ""
-			}
-			return basePurl
-		}
-
-		// Tier 2: synthesise from ecosystem + name
-		ecosystem, _ := pkgMap["ecosystem"].(string)
-		namespace, _ := pkgMap["namespace"].(string)
-		name, _ := pkgMap["name"].(string)
-		if ecosystem != "" && name != "" {
-			return util.GetBasePURLFromComponents(ecosystem, namespace, name)
-		}
-	}
-
-	// Tier 3 — extract pkg:github from GIT range repo URL
-	// e.g. "https://github.com/curl/curl.git" → "pkg:github/curl/curl"
-	if ranges, ok := affMap["ranges"].([]interface{}); ok {
-		for _, rangeItem := range ranges {
-			rangeMap, ok := rangeItem.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if rangeMap["type"] != "GIT" {
-				continue
-			}
-			repo, _ := rangeMap["repo"].(string)
-			if purl := githubRepoToPURL(repo); purl != "" {
-				return purl
-			}
-		}
-	}
-
-	// Tier 4 — database_specific.package as pkg:generic last resort
-	if dbSpecific, ok := content["database_specific"].(map[string]interface{}); ok {
-		if pkgName, ok := dbSpecific["package"].(string); ok && pkgName != "" {
-			logger.Sugar().Warnf("Using pkg:generic fallback for package %q — consider improving OSV record", pkgName)
-			return "pkg:generic/" + strings.ToLower(pkgName)
-		}
-	}
-
-	return ""
-}
-
-// githubRepoToPURL converts a GitHub repository URL to a pkg:github PURL.
-// "https://github.com/curl/curl.git" → "pkg:github/curl/curl"
-func githubRepoToPURL(repoURL string) string {
-	repoURL = strings.TrimSuffix(repoURL, ".git")
-	repoURL = strings.TrimSuffix(repoURL, "/")
-
-	const githubPrefix = "https://github.com/"
-	if !strings.HasPrefix(repoURL, githubPrefix) {
-		return ""
-	}
-
-	path := strings.TrimPrefix(repoURL, githubPrefix)
-	parts := strings.Split(path, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return ""
-	}
-
-	return fmt.Sprintf("pkg:github/%s/%s", parts[0], parts[1])
 }
 
 // ============================================================================
