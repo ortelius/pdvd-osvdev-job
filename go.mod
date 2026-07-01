@@ -1,11 +1,11 @@
 module github.com/ortelius/osv
 
-go 1.26.1
+go 1.26.4
 
 require (
-	github.com/arangodb/go-driver/v2 v2.2.0
+	github.com/arangodb/go-driver/v2 v2.3.1
 	github.com/google/osv-scanner v1.9.2
-	github.com/ortelius/ortelius/v12 v12.0.463
+	github.com/ortelius/ortelius/v12 v12.0.505
 )
 
 require (
@@ -15,24 +15,24 @@ require (
 	github.com/rs/zerolog v1.35.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/text v0.38.0 // indirect
 )
 
 require (
-	github.com/Masterminds/semver/v3 v3.4.0 // indirect
+	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/aquasecurity/go-npm-version v0.0.2 // indirect
 	github.com/aquasecurity/go-pep440-version v0.0.1 // indirect
 	github.com/aquasecurity/go-version v0.0.1 // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
 	github.com/goccy/go-yaml v1.19.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/mattn/go-colorable v0.1.14 // indirect
+	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/package-url/packageurl-go v0.1.6 // indirect
 	github.com/pandatix/go-cvss v0.6.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
