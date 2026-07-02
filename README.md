@@ -8,7 +8,7 @@ On each run the loader fetches the full list of ecosystems published by osv.dev,
 
 1. Normalizes the vulnerability record — package names, version ranges, CVE/GHSA alias mappings, and CVSS scores
 2. Upserts the record into ArangoDB, skipping entries whose modification timestamp has not changed since the last run
-3. Builds `cve2purl` hub edges linking each CVE to the package PURLs it affects, with parsed version range metadata for fast query-time matching
+3. Builds `cve2purl` hub edges linking each CVE to the package PURLs it affects, with parsed version range metadata for fast query-time matching — only `SEMVER`-type ranges get this treatment; `GIT`-type ranges (commit-SHA based, common for C/C++ advisories) are used for PURL resolution but skipped for edge creation, since commit SHAs can't be compared as semantic versions
 4. Rebuilds `release2cve` materialized edges — connecting any existing release records whose SBOM packages fall within the affected version ranges
 5. Updates lifecycle tracking records for all active endpoints, recording whether each CVE was disclosed before or after the software was deployed
 
@@ -29,3 +29,20 @@ The CronJob runs every 15 minutes by default (`*/15 * * * *`) with `concurrencyP
 ## State Persistence
 
 The loader tracks the last processed modification timestamp per ecosystem in ArangoDB. This prevents redundant reprocessing and ensures that lifecycle and edge updates are triggered only for genuinely new vulnerability disclosures.
+
+High-water-mark records are stored in the shared `metadata` collection (one document per ecosystem, keyed by ecosystem name, e.g. `npm`, `pypi`) — the same collection the main Ortelius backend exposes generically via `GET/PUT /api/v1/metadata/:key`. Avoid writing to a key that matches an OSV ecosystem name through that API, as it will overwrite this job's high-water mark and force a full reprocess of that ecosystem's feed on the next run.
+
+## Data Integrity Repair
+
+After every ingestion run, the job performs a targeted repair pass (`RunRepair`, in `repair.go`) for dangling graph edges — `cve2purl` or `release2cve` edges left pointing at a `purl` or `cve` document that no longer exists (e.g. after manual cleanup or a partial failure elsewhere). It only touches the specific subset of edges currently broken, reusing the same `processEdges`/`newVuln` logic as normal ingestion, so it's safe and cheap to run on every execution — once something is fixed, the detection scan simply stops finding it.
+
+This is configurable via environment variables:
+
+| Variable                          | Default | Description                                                                 |
+|------------------------------------|---------|-------------------------------------------------------------------------------|
+| `ARANGO_REPAIR_ENABLED`            | `true`  | Set to `false` to skip the repair pass entirely for a run                    |
+| `ARANGO_REPAIR_QUERY_MEMORY_LIMIT_MB` | `512`   | Caps memory used by each detection scan; set to `0` to remove the cap        |
+
+## Configuration
+
+The job connects to ArangoDB using the same `ARANGO_HOST` / `ARANGO_PORT` / `ARANGO_USER` / `ARANGO_PASS` environment variables as the main Ortelius backend (see the [backend architecture guide](https://github.com/ortelius/ortelius/blob/main/docs/architecture.md#environment-variables-reference)). The bundled Helm chart also sets a `MITRE_MAPPING_URL` environment variable, but it is not currently read anywhere in this job's code — treat it as unused/reserved rather than a functioning setting.
