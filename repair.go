@@ -115,6 +115,10 @@ type missingEdgeTarget struct {
 // exists, and for each distinct source CVE involved, re-runs processEdges()
 // against that CVE's already-stored content. Only CVEs actually implicated
 // in a missing purl target are touched.
+// RepairCVE2Purl finds cve2purl edges whose target purl document no longer
+// exists, and for each distinct source CVE involved, re-runs processEdges()
+// against that CVE's already-stored content. Only CVEs actually implicated
+// in a missing purl target are touched.
 func RepairCVE2Purl(ctx context.Context) (repaired, attempted int, err error) {
 	targets, err := findMissingCVE2PurlTargets(ctx)
 	if err != nil {
@@ -129,13 +133,40 @@ func RepairCVE2Purl(ctx context.Context) (repaired, attempted int, err error) {
 
 	logger.Sugar().Infof("repair: cve2purl - found %d CVE(s) referencing a missing purl document, repairing...", attempted)
 
+	client := &http.Client{Timeout: 30 * time.Second}
+
 	for _, target := range targets {
 		sourceKey := strings.TrimPrefix(target.From, "cve/")
 
 		var content map[string]interface{}
 		if _, err := dbconn.Collections["cve"].ReadDocument(ctx, sourceKey, &content); err != nil {
-			logger.Sugar().Warnf("repair: cve2purl - could not read source CVE %s for missing purl %s: %v", target.From, target.To, err)
-			continue
+			// The source CVE is gone too, not just the purl -- fall back to
+			// osv.dev to recreate it, the same way RepairRelease2CVE does.
+			fetched, found, fetchErr := fetchOSVVulnByID(client, sourceKey)
+			if fetchErr != nil {
+				logger.Sugar().Warnf("repair: cve2purl - source CVE %s missing, and osv.dev fetch failed: %v", target.From, fetchErr)
+				continue
+			}
+			if !found {
+				logger.Sugar().Warnf("repair: cve2purl - source CVE %s missing and no longer on osv.dev, cannot recover", target.From)
+				continue
+			}
+
+			id, _ := fetched["id"].(string)
+			if id == "" || util.SanitizeKey(id) != sourceKey {
+				logger.Sugar().Warnf("repair: cve2purl - osv.dev record for %s has an unexpected or missing id, skipping", target.From)
+				continue
+			}
+
+			util.AddCVSSScoresToContent(fetched)
+
+			if _, insertErr := newVuln(fetched); insertErr != nil {
+				logger.Sugar().Warnf("repair: cve2purl - failed to recreate source CVE %s: %v", target.From, insertErr)
+				continue
+			}
+
+			content = fetched
+			logger.Sugar().Infof("repair: cve2purl - recovered missing source CVE %s from osv.dev", target.From)
 		}
 
 		if err := processEdges(ctx, content); err != nil {
