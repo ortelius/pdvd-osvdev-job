@@ -21,6 +21,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/arangodb/go-driver/v2/arangodb"
@@ -50,6 +52,35 @@ const (
 	// memory-constrained deployments. Set envRepairQueryMemoryLimitMB to
 	// "0" to remove the cap.
 	defaultRepairQueryMemoryLimitMB = 512
+
+	// repairMaxPerRun caps how many cve2purl targets get fixed in a single
+	// invocation. Repair is safe to run every scheduled job (see file
+	// header), so a large backlog just gets worked down over several
+	// runs instead of one run trying to do it all and taking hours.
+	repairMaxPerRun = 5000
+
+	// repairLocalConcurrency bounds how many targets are repaired in
+	// parallel when the source CVE already exists locally (no osv.dev
+	// call needed -- pure ArangoDB work, safe to parallelize).
+	repairLocalConcurrency = 20
+
+	// repairRemoteConcurrency bounds parallelism for the (rarer) case
+	// where the source CVE is *also* missing locally and must be
+	// re-fetched from osv.dev. Kept low and serial-ish to stay well
+	// under osv.dev's public rate limit.
+	repairRemoteConcurrency = 3
+
+	// repairItemTimeout bounds a single target's repair work (local
+	// ArangoDB calls or one osv.dev fetch + local calls), so one slow or
+	// stuck item can't stall the whole batch.
+	repairItemTimeout = 20 * time.Second
+
+	// repairOverallTimeout bounds the entire fix loop (as opposed to
+	// repairQueryTimeout, which only bounds the detection scan). If the
+	// backlog is larger than can be worked through in this window, the
+	// run exits cleanly and the remainder is picked up by the next
+	// scheduled invocation.
+	repairOverallTimeout = 20 * time.Minute
 )
 
 // RunRepair scans only for the currently-dangling subset of cve2purl and
@@ -113,72 +144,217 @@ type missingEdgeTarget struct {
 
 // RepairCVE2Purl finds cve2purl edges whose target purl document no longer
 // exists, and for each distinct source CVE involved, re-runs processEdges()
-// against that CVE's already-stored content. Only CVEs actually implicated
-// in a missing purl target are touched.
-// RepairCVE2Purl finds cve2purl edges whose target purl document no longer
-// exists, and for each distinct source CVE involved, re-runs processEdges()
-// against that CVE's already-stored content. Only CVEs actually implicated
-// in a missing purl target are touched.
+// against that CVE's already-stored content.
+//
+// Performance: the common case (confirmed by investigation -- see the
+// "cve2purl Hub population" note in the file header) is that the source CVE
+// already exists locally, meaning the whole repair is pure ArangoDB work
+// with zero osv.dev calls. This function exploits that:
+//  1. One bulk query partitions targets into "exists locally" vs "needs
+//     osv.dev fetch", instead of N individual ReadDocument round-trips.
+//  2. The local-only subset is repaired with a bounded worker pool, since
+//     there's no external rate limit to respect for pure DB work.
+//  3. The (rare) subset needing an osv.dev fetch keeps low, serial-ish
+//     concurrency to stay under osv.dev's public rate limit.
+//  4. The whole pass is capped by repairMaxPerRun and repairOverallTimeout,
+//     so an oversized backlog is worked down over several scheduled runs
+//     instead of one run trying to finish it all.
 func RepairCVE2Purl(ctx context.Context) (repaired, attempted int, err error) {
 	targets, err := findMissingCVE2PurlTargets(ctx)
 	if err != nil {
 		return 0, 0, fmt.Errorf("scanning cve2purl for missing purl targets: %w", err)
 	}
 
-	attempted = len(targets)
-	if attempted == 0 {
+	if len(targets) == 0 {
 		logger.Sugar().Infoln("repair: cve2purl - no dangling edges found, nothing to do")
 		return 0, 0, nil
 	}
 
-	logger.Sugar().Infof("repair: cve2purl - found %d CVE(s) referencing a missing purl document, repairing...", attempted)
+	total := len(targets)
+	if len(targets) > repairMaxPerRun {
+		logger.Sugar().Infof("repair: cve2purl - %d dangling edge(s) found, capping this run to %d (remainder picked up next run)", total, repairMaxPerRun)
+		targets = targets[:repairMaxPerRun]
+	}
+	attempted = len(targets)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	logger.Sugar().Infof("repair: cve2purl - found %d CVE(s) referencing a missing purl document (of %d total), repairing...", attempted, total)
 
-	for _, target := range targets {
-		sourceKey := strings.TrimPrefix(target.From, "cve/")
+	overallCtx, cancel := context.WithTimeout(ctx, repairOverallTimeout)
+	defer cancel()
 
-		var content map[string]interface{}
-		if _, err := dbconn.Collections["cve"].ReadDocument(ctx, sourceKey, &content); err != nil {
-			// The source CVE is gone too, not just the purl -- fall back to
-			// osv.dev to recreate it, the same way RepairRelease2CVE does.
-			fetched, found, fetchErr := fetchOSVVulnByID(client, sourceKey)
+	sourceKeys := make([]string, len(targets))
+	targetBySourceKey := make(map[string]missingEdgeTarget, len(targets))
+	for i, t := range targets {
+		key := strings.TrimPrefix(t.From, "cve/")
+		sourceKeys[i] = key
+		targetBySourceKey[key] = t
+	}
+
+	localContent, err := bulkFetchCVEContent(overallCtx, sourceKeys)
+	if err != nil {
+		logger.Sugar().Warnf("repair: cve2purl - bulk local lookup failed, falling back to per-item handling: %v", err)
+		localContent = map[string]map[string]interface{}{}
+	}
+
+	var remoteKeys []string
+	for _, key := range sourceKeys {
+		if _, ok := localContent[key]; !ok {
+			remoteKeys = append(remoteKeys, key)
+		}
+	}
+
+	logger.Sugar().Infof("repair: cve2purl - %d resolvable locally (no osv.dev call needed), %d need an osv.dev fetch", len(localContent), len(remoteKeys))
+
+	var repairedCount int64
+
+	// Fast path: source CVE already exists locally -- pure DB work,
+	// parallelize freely.
+	runWithConcurrency(overallCtx, repairLocalConcurrency, mapKeys(localContent), func(itemCtx context.Context, key string) {
+		content := localContent[key]
+		if err := processEdges(itemCtx, content); err != nil {
+			logger.Sugar().Warnf("repair: cve2purl - failed reprocessing edges for cve/%s: %v", key, err)
+			return
+		}
+		atomic.AddInt64(&repairedCount, 1)
+	})
+
+	// Slow path: source CVE missing locally too -- needs osv.dev, keep
+	// concurrency low to respect its rate limit.
+	if len(remoteKeys) > 0 {
+		client := &http.Client{Timeout: 30 * time.Second}
+		runWithConcurrency(overallCtx, repairRemoteConcurrency, remoteKeys, func(itemCtx context.Context, key string) {
+			target := targetBySourceKey[key]
+
+			fetched, found, fetchErr := fetchOSVVulnByID(client, key)
 			if fetchErr != nil {
 				logger.Sugar().Warnf("repair: cve2purl - source CVE %s missing, and osv.dev fetch failed: %v", target.From, fetchErr)
-				continue
+				return
 			}
 			if !found {
 				logger.Sugar().Warnf("repair: cve2purl - source CVE %s missing and no longer on osv.dev, cannot recover", target.From)
-				continue
+				return
 			}
 
 			id, _ := fetched["id"].(string)
-			if id == "" || util.SanitizeKey(id) != sourceKey {
+			if id == "" || util.SanitizeKey(id) != key {
 				logger.Sugar().Warnf("repair: cve2purl - osv.dev record for %s has an unexpected or missing id, skipping", target.From)
-				continue
+				return
 			}
 
 			util.AddCVSSScoresToContent(fetched)
 
 			if _, insertErr := newVuln(fetched); insertErr != nil {
 				logger.Sugar().Warnf("repair: cve2purl - failed to recreate source CVE %s: %v", target.From, insertErr)
-				continue
+				return
 			}
-
-			content = fetched
 			logger.Sugar().Infof("repair: cve2purl - recovered missing source CVE %s from osv.dev", target.From)
-		}
 
-		if err := processEdges(ctx, content); err != nil {
-			logger.Sugar().Warnf("repair: cve2purl - failed reprocessing edges for %s: %v", target.From, err)
-			continue
-		}
-
-		repaired++
+			if err := processEdges(itemCtx, fetched); err != nil {
+				logger.Sugar().Warnf("repair: cve2purl - failed reprocessing edges for %s: %v", target.From, err)
+				return
+			}
+			atomic.AddInt64(&repairedCount, 1)
+		})
 	}
 
+	repaired = int(repairedCount)
 	logger.Sugar().Infof("repair: cve2purl - reprocessed %d/%d CVE(s) referencing a missing purl document", repaired, attempted)
 	return repaired, attempted, nil
+}
+
+// bulkFetchCVEContent fetches content for every key that exists in the cve
+// collection in a single query, instead of one ReadDocument call per key.
+func bulkFetchCVEContent(ctx context.Context, keys []string) (map[string]map[string]interface{}, error) {
+	if len(keys) == 0 {
+		return map[string]map[string]interface{}{}, nil
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, repairQueryTimeout)
+	defer cancel()
+
+	const query = `
+		FOR key IN @keys
+			LET doc = DOCUMENT(CONCAT("cve/", key))
+			FILTER doc != null
+			RETURN doc
+	`
+
+	cursor, err := dbconn.Database.Query(queryCtx, query, &arangodb.QueryOptions{
+		BindVars:    map[string]interface{}{"keys": keys},
+		BatchSize:   repairBatchSize,
+		MemoryLimit: repairQueryMemoryLimitBytes(),
+		Options: arangodb.QuerySubOptions{
+			Stream:     true,
+			AllowRetry: true,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+
+	result := make(map[string]map[string]interface{}, len(keys))
+	for cursor.HasMore() {
+		var doc map[string]interface{}
+		if _, err := cursor.ReadDocument(queryCtx, &doc); err != nil {
+			logger.Sugar().Warnf("repair: bulk CVE lookup aborted early after %d result(s): %v", len(result), err)
+			break
+		}
+		if key, ok := doc["_key"].(string); ok {
+			result[key] = doc
+		}
+	}
+	return result, nil
+}
+
+// runWithConcurrency runs fn for each item using up to `concurrency`
+// goroutines at once, giving each call its own bounded-timeout context
+// derived from ctx. It blocks until every item has been attempted or ctx is
+// done.
+func runWithConcurrency(ctx context.Context, concurrency int, items []string, fn func(itemCtx context.Context, item string)) {
+	if len(items) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	for _, item := range items {
+		if ctx.Err() != nil {
+			logger.Sugar().Warnf("repair: overall deadline reached, stopping early (remainder picked up next run)")
+			break
+		}
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			logger.Sugar().Warnf("repair: overall deadline reached, stopping early (remainder picked up next run)")
+			wg.Wait()
+			return
+		}
+
+		wg.Add(1)
+		go func(item string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			itemCtx, cancel := context.WithTimeout(ctx, repairItemTimeout)
+			defer cancel()
+
+			fn(itemCtx, item)
+		}(item)
+	}
+
+	wg.Wait()
+}
+
+// mapKeys returns the keys of a map[string]map[string]interface{} as a slice.
+func mapKeys(m map[string]map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // findMissingCVE2PurlTargets returns, for every distinct purl document that

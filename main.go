@@ -457,31 +457,28 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 				edge["last_affected_patch"] = *lastAffectedParsed.Patch
 			}
 
-			checkEdgeQuery := `
-				FOR e IN cve2purl
-					FILTER e._from == @from
-					   AND e._to == @to
-					LIMIT 1
-					RETURN e
+			// UPSERT instead of check-then-create: one round-trip instead
+			// of two, and as a side benefit it now also updates the edge
+			// if a re-modified CVE's SEMVER range changed (introduced/
+			// fixed/last_affected) -- the previous check-then-create only
+			// checked for _from/_to existence, so a changed range on an
+			// already-processed CVE silently kept the stale edge forever.
+			edgeKey := cveKey + "_" + purlKey
+			edge["_key"] = edgeKey
+
+			edgeUpsertQuery := `
+				UPSERT { _key: @key }
+				INSERT @doc
+				UPDATE @doc
+				IN cve2purl
 			`
-			cursor, err := dbconn.Database.Query(ctx, checkEdgeQuery, &arangodb.QueryOptions{
+			if _, err := dbconn.Database.Query(ctx, edgeUpsertQuery, &arangodb.QueryOptions{
 				BindVars: map[string]interface{}{
-					"from": cveDocID,
-					"to":   purlDocID,
+					"key": edgeKey,
+					"doc": edge,
 				},
-			})
-			if err != nil {
-				continue
-			}
-
-			exists := cursor.HasMore()
-			cursor.Close()
-
-			if !exists {
-				_, err = dbconn.Collections["cve2purl"].CreateDocument(ctx, edge)
-				if err != nil {
-					logger.Sugar().Warnf("Failed to create cve2purl edge from %s to %s: %v", cveDocID, purlDocID, err)
-				}
+			}); err != nil {
+				logger.Sugar().Warnf("Failed to upsert cve2purl edge from %s to %s: %v", cveDocID, purlDocID, err)
 			}
 		}
 	}
