@@ -365,12 +365,21 @@ func processEdges(ctx context.Context, content map[string]interface{}) error {
 			UPDATE {}
 			IN purl
 		`
-		dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
+		if _, err := dbconn.Database.Query(ctx, purlUpsertQuery, &arangodb.QueryOptions{
 			BindVars: map[string]interface{}{
 				"key": purlKey,
 				"doc": purlNode,
 			},
-		})
+		}); err != nil {
+			// Don't create a cve2purl edge pointing at a purl document
+			// that was never actually written -- that produces a
+			// permanently-dangling edge (ArangoDB doesn't enforce
+			// referential integrity on edge collections), which repair
+			// would then "fix" and immediately recreate as dangling
+			// again on every subsequent run, forever.
+			logger.Sugar().Warnf("Failed to upsert purl document %q for CVE %s, skipping edge: %v", basePurl, cveID, err)
+			continue
+		}
 
 		purlDocID := "purl/" + purlKey
 
