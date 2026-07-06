@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/arangodb/go-driver/v2 v2.3.1
 	github.com/google/osv-scanner v1.9.2
-	github.com/ortelius/ortelius/v12 v12.0.505
+	github.com/ortelius/ortelius/v12 v12.0.507
 )
 
 require (
@@ -16,7 +16,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 )
 
 require (
