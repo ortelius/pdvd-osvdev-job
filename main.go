@@ -255,7 +255,10 @@ func githubRepoToPURL(repoURL string) string {
 		return ""
 	}
 
-	return fmt.Sprintf("pkg:github/%s/%s", parts[0], parts[1])
+	// Reuse the shared, centrally-normalized purl builder instead of
+	// hand-rolling the string, so github owner/repo casing matches every
+	// other consumer (e.g. SBOM component purls built the same way).
+	return util.GetBasePURLFromComponents("Github", parts[0], parts[1])
 }
 
 // resolvePURL attempts to determine a base PURL for an affected entry using
@@ -284,6 +287,15 @@ func resolvePURL(affMap map[string]interface{}, content map[string]interface{}) 
 		namespace, _ := pkgMap["namespace"].(string)
 		name, _ := pkgMap["name"].(string)
 		if ecosystem != "" && name != "" {
+			// Julia is a registered purl type (added to the purl-spec Oct 2025):
+			// pkg:julia/<Name> — no namespace, case preserved (Julia package
+			// names are case-sensitive, e.g. HTTP != http). This must match
+			// what real Julia SBOM tools (Trivy, PkgToSoftwareBOM.jl) emit,
+			// so the JLL suffix (e.g. rsync_jll) is kept as-is rather than
+			// resolved to the wrapped upstream library name.
+			if strings.EqualFold(ecosystem, "Julia") {
+				return "pkg:julia/" + name
+			}
 			return util.GetBasePURLFromComponents(ecosystem, namespace, name)
 		}
 	}
