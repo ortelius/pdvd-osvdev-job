@@ -842,10 +842,4 @@ func getCVEsForReleases(ctx context.Context, releases []ReleaseInfo) (map[string
 
 func main() {
 	LoadFromOSVDev()
-
-	// Recreate any documents that dangling cve2purl/release2cve edges are
-	// pointing at, using only the currently-broken subset (see repair.go).
-	// Safe to run every execution: once something's fixed, the detection
-	// scans that drive this simply won't find it again.
-	RunRepair()
 }
