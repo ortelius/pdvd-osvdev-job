@@ -17,41 +17,83 @@ kind: CronJob
 metadata:
   name: {{ include "microservice.name" . }}
 spec:
-  schedule: "*/15 * * * *"
-  concurrencyPolicy: Forbid
+  schedule: {{ .Values.schedule | default "*/15 * * * *" | quote }}
+  concurrencyPolicy: {{ .Values.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ .Values.successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ .Values.failedJobsHistoryLimit | default 1 }}
+  startingDeadlineSeconds: {{ .Values.startingDeadlineSeconds | default 120 }}
   jobTemplate:
     spec:
+      {{- with .Values.activeDeadlineSeconds }}
+      # Caps a run below the schedule interval. Without this, a stalled
+      # fetch pushes the run past 15 min and concurrencyPolicy: Forbid
+      # silently skips every subsequent tick.
+      activeDeadlineSeconds: {{ . }}
+      {{- end }}
+      backoffLimit: {{ .Values.backoffLimit | default 2 }}
+      {{- with .Values.ttlSecondsAfterFinished }}
+      ttlSecondsAfterFinished: {{ . }}
+      {{- end }}
       template:
         spec:
           nodeSelector:
-            kubernetes.io/os: linux
+            {{- toYaml (.Values.nodeSelector | default (dict "kubernetes.io/os" "linux")) | nindent 12 }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           containers:
-          - name: {{ include "microservice.name" . }}
-            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-            imagePullPolicy: IfNotPresent
-            env:
-              - name: MITRE_MAPPING_URL
-                value:
-              - name: ARANGO_USER
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBUserName
-              - name: ARANGO_PASS
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBPassword
-              - name: ARANGO_HOST
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBHost
-              - name: ARANGO_PORT
-                valueFrom:
-                  secretKeyRef:
-                    name: arangodb
-                    key: DBPort
-              - name: MS_PORT
-                value: "8080"
-          restartPolicy: OnFailure
+            - name: {{ include "microservice.name" . }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
+              env:
+                - name: MITRE_MAPPING_URL
+                  value: "{{ .Values.mitreMappingUrl | default "" }}"
+                - name: ARANGO_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBUserName
+                - name: ARANGO_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBPassword
+                - name: ARANGO_HOST
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBHost
+                - name: ARANGO_PORT
+                  valueFrom:
+                    secretKeyRef:
+                      name: arangodb
+                      key: DBPort
+                - name: MS_PORT
+                  value: "8080"
+                {{- with .Values.http }}
+                - name: OSV_DIAL_TIMEOUT
+                  value: {{ .dialTimeout | default "10s" | quote }}
+                - name: OSV_TLS_TIMEOUT
+                  value: {{ .tlsTimeout | default "10s" | quote }}
+                - name: OSV_RESPONSE_HEADER_TIMEOUT
+                  value: {{ .responseHeaderTimeout | default "60s" | quote }}
+                - name: OSV_REQUEST_TIMEOUT
+                  value: {{ .requestTimeout | default "240s" | quote }}
+                - name: OSV_MAX_ATTEMPTS
+                  value: {{ .maxAttempts | default 3 | quote }}
+                - name: OSV_MAX_BODY_MB
+                  value: {{ .maxBodyMB | default 512 | quote }}
+                {{- end }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              {{- with .Values.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+          restartPolicy: {{ .Values.restartPolicy | default "OnFailure" }}

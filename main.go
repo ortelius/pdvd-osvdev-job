@@ -17,10 +17,14 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,27 +39,135 @@ var logger = database.InitLogger()
 var dbconn = database.InitializeDatabase()
 
 // ============================================================================
+// HTTP tunables
+//
+// All overridable by env var so the CronJob can be retuned without a rebuild.
+// Defaults are chosen so a worst-case run stays under activeDeadlineSeconds
+// (780s) in the Helm chart:
+//   perRequestTimeout (240s) x maxAttempts is bounded per ecosystem, and a
+//   failed ecosystem is skipped rather than aborting the whole run.
+// ============================================================================
+
+var (
+	dialTimeout           = envDuration("OSV_DIAL_TIMEOUT", 10*time.Second)
+	tlsHandshakeTimeout   = envDuration("OSV_TLS_TIMEOUT", 10*time.Second)
+	responseHeaderTimeout = envDuration("OSV_RESPONSE_HEADER_TIMEOUT", 60*time.Second)
+	perRequestTimeout     = envDuration("OSV_REQUEST_TIMEOUT", 240*time.Second)
+	maxAttempts           = envInt("OSV_MAX_ATTEMPTS", 3)
+	maxBodyBytes          = int64(envInt("OSV_MAX_BODY_MB", 512)) << 20
+)
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// httpGetWithRetry fetches url with a per-attempt context deadline, so a
+// stalled read is cancelled rather than hanging indefinitely. Retries on
+// timeout and on 5xx; 4xx is returned immediately since retrying will not
+// help. The body is capped at maxBodyBytes to bound memory.
+func httpGetWithRetry(client *http.Client, urlStr, label string) ([]byte, error) {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		start := time.Now()
+
+		ctx, cancel := context.WithTimeout(context.Background(), perRequestTimeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("%s: build request: %w", label, err)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			lastErr = err
+			if errors.Is(err, context.DeadlineExceeded) {
+				logger.Sugar().Warnf("%s: attempt %d/%d timed out after %s", label, attempt, maxAttempts, time.Since(start).Round(time.Millisecond))
+			} else {
+				logger.Sugar().Warnf("%s: attempt %d/%d failed after %s: %v", label, attempt, maxAttempts, time.Since(start).Round(time.Millisecond), err)
+			}
+			backoff(attempt)
+			continue
+		}
+
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			resp.Body.Close()
+			cancel()
+			return nil, fmt.Errorf("%s: HTTP %d", label, resp.StatusCode)
+		}
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			cancel()
+			lastErr = fmt.Errorf("%s: HTTP %d", label, resp.StatusCode)
+			logger.Sugar().Warnf("%s: attempt %d/%d got HTTP %d", label, attempt, maxAttempts, resp.StatusCode)
+			backoff(attempt)
+			continue
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		resp.Body.Close()
+		cancel()
+		if err != nil {
+			lastErr = err
+			logger.Sugar().Warnf("%s: attempt %d/%d body read failed after %s: %v", label, attempt, maxAttempts, time.Since(start).Round(time.Millisecond), err)
+			backoff(attempt)
+			continue
+		}
+
+		logger.Sugar().Debugf("%s: fetched %d bytes in %s (attempt %d)", label, len(body), time.Since(start).Round(time.Millisecond), attempt)
+		return body, nil
+	}
+
+	return nil, fmt.Errorf("%s: all %d attempts failed: %w", label, maxAttempts, lastErr)
+}
+
+func backoff(attempt int) {
+	time.Sleep(time.Duration(attempt) * 2 * time.Second)
+}
+
+// ============================================================================
 // Main Import Logic
 // ============================================================================
 
 func LoadFromOSVDev() {
 	baseURL := "https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/ecosystems.txt?alt=media"
 
+	// Bounded transport. Without these, a stalled TCP read blocks forever:
+	// a single slow ecosystem fetch pushed a run past its 15 minute schedule,
+	// and concurrencyPolicy: Forbid then skipped every subsequent tick.
+	//
+	// ResponseHeaderTimeout bounds the wait for the first byte. The body read
+	// itself is bounded per-request by the context in httpGetWithRetry, since
+	// a flat Client.Timeout would also cap large legitimate downloads.
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false, MinVersion: tls.VersionTLS12},
-		MaxIdleConns:    100,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: false, MinVersion: tls.VersionTLS12},
+		MaxIdleConns:          100,
+		DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 5 * time.Second,
 	}
 	client := &http.Client{Transport: tr}
 
-	resp, err := client.Get(baseURL)
+	body, err := httpGetWithRetry(client, baseURL, "ecosystems.txt")
 	if err != nil {
 		logger.Sugar().Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Sugar().Fatalln(err)
 	}
 
 	lines := strings.Split(string(body), "\n")
@@ -91,18 +203,18 @@ func processEcosystem(client *http.Client, platform string) int {
 	lastRunTime, _ := util.GetLastRun(dbconn, platform)
 	urlStr := fmt.Sprintf("https://www.googleapis.com/download/storage/v1/b/osv-vulnerabilities/o/%s%%2Fall.zip?alt=media", url.PathEscape(platform))
 
-	resp, err := client.Get(urlStr)
-	if err != nil {
-		logger.Sugar().Errorf("Failed to download %s: %v", platform, err)
-		return 0
-	}
-	defer resp.Body.Close()
+	start := time.Now()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpGetWithRetry(client, urlStr, platform)
 	if err != nil {
-		logger.Sugar().Errorf("Failed to read body for %s: %v", platform, err)
+		// A single bad ecosystem must not abort the run. Skipping it means
+		// the next scheduled tick retries it; hanging here means every
+		// subsequent tick is skipped by concurrencyPolicy: Forbid.
+		logger.Sugar().Errorf("Ecosystem: %s | SKIPPED after %s: %v", platform, time.Since(start).Round(time.Millisecond), err)
 		return 0
 	}
+
+	downloadDur := time.Since(start)
 
 	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
@@ -162,10 +274,12 @@ func processEcosystem(client *http.Client, platform string) int {
 		if maxSeenTime.IsZero() {
 			maxSeenTime = time.Now().UTC()
 		}
-		logger.Sugar().Infof("Ecosystem: %s | New CVEs: %d | Updating high water mark to %s", platform, cveCount, maxSeenTime.Format(time.RFC3339))
+		logger.Sugar().Infof("Ecosystem: %s | New CVEs: %d | download=%s total=%s | Updating high water mark to %s",
+			platform, cveCount, downloadDur.Round(time.Millisecond), time.Since(start).Round(time.Millisecond), maxSeenTime.Format(time.RFC3339))
 		util.SaveLastRun(dbconn, platform, maxSeenTime)
 	} else {
-		logger.Sugar().Infof("Ecosystem: %s | No new CVEs found", platform)
+		logger.Sugar().Infof("Ecosystem: %s | No new CVEs found | download=%s total=%s",
+			platform, downloadDur.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 	}
 
 	return cveCount
